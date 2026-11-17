@@ -83,28 +83,89 @@ def images():
 # ---------------------------------------------------------------- ocr
 MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
 V5 = ('https://huggingface.co/bukuroo/PPOCRv5-ONNX/resolve/main/', 'ppocrv5-server-rec.onnx', 'ppocrv5_dict.txt')
+V6 = 'https://huggingface.co/PaddlePaddle/PP-OCRv6_medium_rec_onnx/resolve/main/'
+DASH = '—―‒–-一'
 
-def make_engine():
-    """识别模型默认 PP-OCRv5 server（简繁通吃；RapidOCR 自带的 v4 对繁体大量丢字、转简）。config rec:'v4' 回退。"""
-    from rapidocr_onnxruntime import RapidOCR
-    if CFG.get('rec', 'v5') != 'v5': return RapidOCR()
+def fetch_model(v):
+    """v5：社区导出的 ONNX + 字典；v6：官方 ONNX，字典从 inference.yml 抽出。返回 (onnx, dict)"""
     os.makedirs(MODELS, exist_ok=True)
-    for f in V5[1:]:
-        if not os.path.exists(f'{MODELS}/{f}'): subprocess.run(['curl', '-sL', '-o', f'{MODELS}/{f}', V5[0] + f], check=True)
-    return RapidOCR(rec_model_path=f'{MODELS}/{V5[1]}', rec_keys_path=f'{MODELS}/{V5[2]}')
+    if v == 'v5':
+        for f in V5[1:]:
+            if not os.path.exists(f'{MODELS}/{f}'): subprocess.run(['curl', '-sL', '-o', f'{MODELS}/{f}', V5[0] + f], check=True)
+        return f'{MODELS}/{V5[1]}', f'{MODELS}/{V5[2]}'
+    onnx, yml, dic = (f'{MODELS}/ppocrv6-medium-rec.{e}' for e in ('onnx', 'yml', 'txt'))
+    for f, u in ((onnx, 'inference.onnx'), (yml, 'inference.yml')):
+        if not os.path.exists(f): subprocess.run(['curl', '-sL', '-o', f, V6 + u], check=True)
+    if not os.path.exists(dic):
+        import yaml
+        open(dic, 'w').write('\n'.join(yaml.safe_load(open(yml))['PostProcess']['character_dict']) + '\n')
+    return onnx, dic
+
+def make_engine(v=None):
+    """识别模型默认 PP-OCRv6 medium（简繁英日一个模型；比 v5 server 少约7%错字，但会漏掉破折号，cmd_ocr 用 v5 补回）。
+    config rec:'v5' 用 PP-OCRv5 server；'v4' 用 RapidOCR 自带模型（繁体大量丢字、转简）。检测模型都用 RapidOCR 自带的。"""
+    from rapidocr_onnxruntime import RapidOCR
+    v = v or CFG.get('rec', 'v6')
+    if v not in ('v5', 'v6'): return RapidOCR()
+    m, d = fetch_model(v)
+    return RapidOCR(rec_model_path=m, rec_keys_path=d)
+
+def dash_gaps(row, img_w):
+    """v6 识别时常把破折号整个丢掉，只在逐字框里留下一段空白。返回可疑空白处的字序号（-1=行首，n-1=行尾）"""
+    cb, txt = row['cboxes'], row['text']
+    if len(cb) != len(txt) or len(cb) < 3: return []
+    ws = sorted(b - a for a, b in cb if b > a); cw = ws[len(ws) // 2] if ws else 0
+    if cw <= 0: return []
+    b = bbox(row['box']); out = []
+    for i in range(len(cb) - 1):
+        if cb[i + 1][0] - cb[i][1] > 1.2 * cw and re.match(CJK + '|[，。、；：「」『』（）]', txt[i] + txt[i + 1][:0]): out.append(i)
+    if cb[0][0] - b[0] > 1.5 * cw: out.append(-1)
+    if b[2] - cb[-1][1] > 1.5 * cw: out.append(len(cb) - 1)
+    return out
+
+def patch_dashes(row, gaps, v5txt):
+    """把 v5 在同一行同一位置识出的破折号插回 v6 结果；只插破折号，别的字仍以 v6 为准"""
+    txt, cb, ch = row['text'], row['cboxes'], row['chars']; ins = {}
+    for op, a1, a2, b1, b2 in difflib.SequenceMatcher(None, txt, v5txt, autojunk=False).get_opcodes():
+        seg = v5txt[b1:b2]
+        if op == 'insert' and seg and all(c in DASH for c in seg) and (a1 - 1) in gaps:
+            ins[a1 - 1] = seg
+    ws = sorted(b - a for a, b in cb if b > a); cw = ws[len(ws) // 2]
+    for i in sorted(ins, reverse=True):
+        x0 = cb[i][1] if i >= 0 else bbox(row['box'])[0]; x1 = cb[i + 1][0] if i + 1 < len(cb) else bbox(row['box'])[2]
+        ins[i] = '——' if x1 - x0 > 1.5 * cw else '—'   # 中文破折号占两字宽；v5 也常只识出一半或识成"一一"
+        n = len(ins[i]); step = (x1 - x0) / n
+        txt = txt[:i + 1] + ins[i] + txt[i + 1:]
+        cb[i + 1:i + 1] = [[x0 + k * step, x0 + (k + 1) * step] for k in range(n)]
+        ch[i + 1:i + 1] = list(ins[i])
+    row['text'] = txt
+    return bool(ins)
 
 def cmd_ocr():
-    from rapidocr_onnxruntime import RapidOCR
-    eng = make_engine(); out = {}
+    from PIL import Image
+    import numpy as np
+    eng = make_engine(); v6 = CFG.get('rec', 'v6') == 'v6'; e5 = None; out = {}; fixed = 0
     for i, p in enumerate(images(), 1):
         res, _ = eng(p, return_word_box=True)
         rows = []
         for r in res or []:
             boxes = r[3] if len(r) > 3 else []; chars = r[4] if len(r) > 4 else []
             rows.append({'box': [[float(a) for a in pt] for pt in r[0]], 'text': r[1], 'conf': float(r[2]),
-                         'cboxes': [[min(q[0] for q in b), max(q[0] for q in b)] for b in boxes], 'chars': chars})
+                         'cboxes': [[min(q[0] for q in b), max(q[0] for q in b)] for b in boxes], 'chars': list(chars)})
+        if v6 and CFG.get('dash_fix', True):
+            im = None
+            for row in rows:
+                g = dash_gaps(row, 0)
+                if not g: continue
+                if e5 is None: e5 = make_engine('v5')
+                if im is None: im = Image.open(p).convert('RGB')
+                b = bbox(row['box']); h = b[3] - b[1]
+                crop = np.array(im.crop((max(0, b[0] - h * .3), b[1], b[2] + h * .3, b[3])))[:, :, ::-1]
+                r5, _ = e5(crop, use_det=False, use_cls=False)
+                if r5: fixed += patch_dashes(row, g, r5[0][0])
         out[i] = rows; print(i, len(rows), flush=True)
         json.dump(out, open(J('words.json'), 'w'), ensure_ascii=False)
+    if v6: print('v5 补回破折号的行', fixed)
 
 # ---------------------------------------------------------------- classify
 def find_rule(im, H, W):

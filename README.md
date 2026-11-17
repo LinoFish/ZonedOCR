@@ -15,7 +15,7 @@ pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow
 # 另需 poppler-utils（pdftotext）
 ```
 
-首次运行会下载 PP-OCRv5 识别模型（约 85MB）到 `models/`。
+首次运行会下载 PP-OCRv6 medium 识别模型（约 77MB），补破折号用的 PP-OCRv5 server（约 85MB）按需下载，都放在 `models/`。
 
 ## 用法
 

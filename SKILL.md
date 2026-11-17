@@ -16,7 +16,7 @@ description: 把扫描版（中文为主、夹英文，简繁皆可；支持横�
    - `margin_regex` `\d{3}`：版心外的边码（原书页码）；书里没有就设成 `"$^"`。
    - `note_rule` true、`rule_override` {"页序": y}：脚注分隔线检测/手工指定。
    - `toc` true、`toc_patterns`：章节书签规则；`toc_extra` [[层级, 标题, 页]] 手工补书签。
-   - `rec`：识别模型，默认 v5。
+   - `rec`：识别模型，默认 v6（另可 v5、v4）；`dash_fix` true：用 v5 补回 v6 漏掉的破折号。
    - `spread` "auto"：横向双页（页宽>1.15倍页高）自动按中缝拆成左右两页处理；`false` 关闭。
    - `columns` "auto"：自动分栏；`1` 关闭。`figures` true：识别图表区。
 2. `python3 scanocr.py WORK images` → `ocr`（约1页/秒，页多时放后台）→ `classify`。600dpi 大图会自动缩到长边约2800px。
@@ -36,7 +36,7 @@ description: 把扫描版（中文为主、夹英文，简繁皆可；支持横�
 7. 交付 PDF。说明：原扫描图+隐形文字层、已校对、改了哪些类错误。
 
 ## 繁体/旧字形书
-- 识别模型默认 PP-OCRv5 server（首次运行自动下载约85MB到 models/，约14秒/页）；RapidOCR 自带 v4 对繁体大量丢字、转简。config `"rec": "v4"` 可回退。
+- 识别模型默认 PP-OCRv6 medium（官方 ONNX，首次运行自动下载约77MB到 models/，约16秒/页）。在一本繁体书30页上对校对稿实测，v5/v6 识别不同的行里 v6 对 67 行、v5 对 23 行。v6 会整个丢掉破折号：ocr 对逐字框里有大空白的行再用 PP-OCRv5 server 重识别，只把破折号插回（config `dash_fix: false` 关闭）。v6 常输出 内/衆/丢 等异体，原书用 內/眾/丟 时在 R[0] 全书替换。config `"rec": "v5"` 回退 PP-OCRv5 server，`"v4"` 回退 RapidOCR 自带模型（繁体大量丢字、转简）。
 - v5 输出标准字形：原书用旧字形时在 corrections.R[0] 全书替换（如 為→爲、真→眞），引文里原样保留的在页规则里改回。v5 常把"注"识成"註"、"卷"识成"捲"。
 - 首字下沉：ADD 一个紧贴首行左侧的框，会自动并入该行。
 
