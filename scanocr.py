@@ -36,6 +36,7 @@ CFG = {
     "folio_band": 0.90,        # 页底此比例以下、且≤4字符为页码
     "margin_regex": r"\d{3}",  # 版心外的边码（原书页码）
     "note_rule": True,         # 用脚注分隔短横线判定脚注区
+    "auto_folio": True,         # 漏识别页码时按其它页页码的中位位置补一个；原书本无页码的页（如分部扉页）可关掉
     "rule_override": {},       # {"页序": y像素} 未检出分隔线时手工给
     "render_dpi": 300,         # 页面不是单张嵌入图时的渲染分辨率
 }
@@ -534,7 +535,7 @@ def final_pages():
                 t = apply_rules(R.get(0, []), t)   # R[0]=全书通用规则，先做；页规则在其后，可以把个别处改回
                 t = apply_rules(R.get(pg, []), t)
                 t = normalize(t)
-                if l['kind'] == 'note': t = re.sub(r'^(\d{1,3})[\s　]*(?=\S)', r'\1　', t)   # 脚注号后全角空格
+                if l['kind'] == 'note': t = re.sub(r'^(\d{1,3})(?![\d])[\s　]*(?=\S)', r'\1　', t)   # 脚注号后全角空格；(?![\d])防回溯把独立成行的两位数号拆成“2　3”
             l['text'] = t
         pages[pg] = layout_lines({'w': p['w'], 'h': p['h'], 'lines': lines, 'rule_y': p.get('rule_y'),
                                   'regions': p.get('regions'), 'cols': p.get('cols'), 'figs': p.get('figs', [])})
@@ -549,10 +550,11 @@ def final_pages():
     lab, _ = page_labels(pages)   # 页码文字统一成推算出的印刷页码（修正误识）
     single = [p for p in pages.values() if len(p.get('regions') or [0]) == 1]
     fb = [l['box'] for p in single for l in p['lines'] if l['kind'] == 'folio']
-    for pg, p in pages.items():   # 漏识别页码的单页：按其它页页码的中位位置补一个（双页不补）
-        if fb and pg in lab and p in single and not any(l['kind'] == 'folio' for l in p['lines']):
+    for pg, p in pages.items():   # 漏识别页码的单页：按其它页页码的中位位置补一个（双页不补）；auto_folio=false 时不补（原书本无页码的扉页/分部页）
+        if CFG.get('auto_folio', True) and fb and pg in lab and p in single and not any(l['kind'] == 'folio' for l in p['lines']):
             box = [int(statistics.median(b[i] for b in fb)) for i in range(4)]
-            p['lines'].append({'kind': 'folio', 'box': box, 'ocr': '', 'text': '', 'conf': 1, 'auto': True, 'ri': 0, 'ci': 0, 'seg': 0, 'fi': -1})
+            p['lines'].append({'kind': 'folio', 'box': box, 'ocr': '', 'text': '', 'conf': 1, 'auto': True, 'ri': 0, 'ci': 0, 'seg': 0, 'fi': -1,
+                               'bx': (p.get('regions') or [[0, p['w']]])[0]})
     for pg, p in pages.items():
         if pg in lab:
             st, n0, _ = lab[pg]
@@ -741,7 +743,9 @@ def cmd_build():
         page = doc[pg - 1]; sx = page.rect.width / p['w']; sy = page.rect.height / p['h']; PH = page.rect.height
         kinds = ['body', 'note', 'figs'] if zot else WRITE_ORDER
         if '--kinds' in ARGS: kinds = ARGS[ARGS.index('--kinds') + 1].split(',')
-        # 每行一个 BT…ET；行内每字只写 "Tz <gid>Tj"：Tz=字框宽/字形宽，字框首尾相接，所以顺序前进正好落在原图位置。
+        # 每行一个 BT…ET；行内按字体分段、每段一个 Tj：段内各字用自然字距连续写
+        # 出，整段 Tz 一次缩放到与字框总宽一致。旧写法逐字 Tj + 逐字 Tz 会把每字
+        # 拆成独立 span（单页数百个），阅读器选词/高亮到英文空格处会断开。
         # 整页一个字体资源。先用 TextWriter 写同样的字让 PyMuPDF 登记字体和 ToUnicode，再把它生成的流换成我们的。
         ops, alltext, alt_text = [], [], []
         for kind in kinds:   # 写入顺序=选择顺序；正文先写，其它区排在后面
@@ -767,13 +771,22 @@ def cmd_build():
                     f = cjk if cjk.has_glyph(ord(ch)) else lat   # Droid 缺的（⁴⁵⁶…）用 Noto 补
                     g = f.has_glyph(ord(ch)); adv = f.glyph_advance(ord(ch)) * fs
                     if not g or adv <= 0: continue
-                    seq.append((ch, g, cx0 * sx, max((cx1 - cx0) * sx, .3) / adv * 100, f is lat))
+                    seq.append((ch, g, cx0 * sx, cx1 * sx, adv, f is lat))
                 if not seq: continue
-                for c in seq: (alt_text if c[4] else alltext).append(c[0])
-                o = [f'BT /FONT {fs:.3f} Tf 1 0 0 1 {seq[0][2]:.2f} {PH - base:.2f} Tm']; cur = False
-                for ch, g, x, tz, isl in seq:
-                    if isl != cur: o.append(f'/{"FONT2" if isl else "FONT"} {fs:.3f} Tf'); cur = isl
-                    o.append(f'{tz:.2f} Tz <{g:04x}>Tj')
+                for c in seq: (alt_text if c[5] else alltext).append(c[0])
+                o = [f'BT /FONT {fs:.3f} Tf 1 0 0 1 {seq[0][2]:.2f} {PH - base:.2f} Tm']; cur = None
+                i = 0
+                while i < len(seq):
+                    isl = seq[i][5]; j = i
+                    while j < len(seq) and seq[j][5] == isl: j += 1
+                    run = seq[i:j]
+                    if isl != cur:
+                        o.append(f'/{"FONT2" if isl else "FONT"} {fs:.3f} Tf'); cur = isl
+                    total_cell = max(run[-1][3] - run[0][2], .3)
+                    total_adv = sum(c[4] for c in run)
+                    tz = total_cell / total_adv * 100 if total_adv > 0 else 100.0
+                    o.append(f'{tz:.2f} Tz <{"".join(f"{c[1]:04x}" for c in run)}>Tj')
+                    i = j
                 ops.append('\n'.join(o) + '\nET')
         if not ops: continue
         old = set(page.get_contents())
