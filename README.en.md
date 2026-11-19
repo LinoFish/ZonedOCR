@@ -10,7 +10,7 @@ Ordinary OCR only makes a scanned book searchable. ZonedOCR understands the page
 - **Smart zoning**: body text, footnotes, figures, running headers, margin numbers and folios are written as separate zones, so selecting body text never drags in headers, page numbers or notes
 - **Printed page numbers**: detects the book's own page numbers and writes them as PDF page labels (Roman-numeral front matter included), so Zotero and other readers cite the original pages; misread folios are corrected from neighbouring pages
 - **Automatic bookmarks**: chapter and section headings become an outline
-- **Orientation & deskew**: upside-down or sideways pages (90°/180°/270°) are detected and small skews straightened; the output PDF uses the corrected page images
+- **Orientation & deskew**: upside-down or sideways pages (90°/180°/270°) are detected and small skews straightened; the output PDF uses the corrected page images. Adds about 20 s per page on a 2-core CPU; the prompt shows the estimated extra time for your book
 - **Complex layouts**: two-page landscape scans are split; multi-column pages copy column by column; figures and captions are grouped
 - **Character-level alignment**: highlights sit on the scanned glyphs and stay continuous in browsers and Zotero
 - **Proofreading pass**: page-by-page corrections against the image (`corrections.py`); punctuation set to full- or half-width by Chinese/English context
@@ -34,7 +34,7 @@ One command does everything. It asks three questions up front — Zotero edition
 python3 zonedocr.py run book.pdf
 # 要 Zotero 优化版吗？... [y/N] y        (Zotero edition?)
 # 要识别目录大纲（章节书签）吗？ [Y/n]    (Detect TOC / bookmarks?)
-# 要自动识别页面方向、扶正歪斜的页面吗？ [Y/n]  (Fix orientation & skew?)
+# 要自动识别页面方向、扶正歪斜的页面吗？（每页约多 20 秒…） [Y/n]  (Fix orientation & skew? shows the extra time for this book)
 # … 完成：book_work/book_OCR_Zotero.pdf
 ```
 

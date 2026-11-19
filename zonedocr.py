@@ -35,7 +35,11 @@ def cmd_run():
     pick = lambda on, off, q, d: True if on in fl else False if off in fl else ask(q, d)
     zot = pick('--zotero', '--no-zotero', '要 Zotero 优化版吗？（在 Zotero 里阅读、高亮、复制时用）', False)
     toc = pick('--toc', '--no-toc', '要识别目录大纲（章节书签）吗？', True)
-    desk = pick('--deskew', '--no-deskew', '要自动识别页面方向、扶正歪斜的页面吗？', True)
+    try:
+        import pymupdf; npg = len(pymupdf.open(src))
+    except Exception: npg = 0
+    est = f'本书 {npg} 页，约多 {max(1, round(npg * 20 / 60))} 分钟' if npg else '每页约多 20 秒'
+    desk = pick('--deskew', '--no-deskew', f'要自动识别页面方向、扶正歪斜的页面吗？（每页约多 20 秒，{est}；扫描端正的书可以不选）', True)
     os.makedirs(work, exist_ok=True); cf = os.path.join(work, 'config.json')
     cfg = json.load(open(cf)) if os.path.exists(cf) else {}
     cfg.update({'src': src, 'out': base + ('_OCR_Zotero.pdf' if zot else '_OCR.pdf'), 'zotero': zot, 'toc': toc, 'deskew': desk})
