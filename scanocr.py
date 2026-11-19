@@ -743,9 +743,9 @@ def cmd_build():
         page = doc[pg - 1]; sx = page.rect.width / p['w']; sy = page.rect.height / p['h']; PH = page.rect.height
         kinds = ['body', 'note', 'figs'] if zot else WRITE_ORDER
         if '--kinds' in ARGS: kinds = ARGS[ARGS.index('--kinds') + 1].split(',')
-        # 每行一个 BT…ET；行内按字体分段、每段一个 Tj：段内各字用自然字距连续写
-        # 出，整段 Tz 一次缩放到与字框总宽一致。旧写法逐字 Tj + 逐字 Tz 会把每字
-        # 拆成独立 span（单页数百个），阅读器选词/高亮到英文空格处会断开。
+        # 每行一个 BT…ET；行内每字只写 "Tz <gid>Tj"：Tz=字框宽/字形宽，字框首尾相接，所以顺序前进正好落在原图位置。
+        # 不要改成整段一个 Tz：中文全角、英文比例字宽和扫描字形宽度不成比例，整段缩放会偏移到一两个字宽，高亮对不上原图；
+        # 阅读器（pdf.js/Zotero）不会因 Tz 变化拆行。英文词间高亮断开是 Zotero 丢弃 U+0020 所致，Zotero 版已改写成 U+00A0。
         # 整页一个字体资源。先用 TextWriter 写同样的字让 PyMuPDF 登记字体和 ToUnicode，再把它生成的流换成我们的。
         ops, alltext, alt_text = [], [], []
         for kind in kinds:   # 写入顺序=选择顺序；正文先写，其它区排在后面
@@ -771,22 +771,13 @@ def cmd_build():
                     f = cjk if cjk.has_glyph(ord(ch)) else lat   # Droid 缺的（⁴⁵⁶…）用 Noto 补
                     g = f.has_glyph(ord(ch)); adv = f.glyph_advance(ord(ch)) * fs
                     if not g or adv <= 0: continue
-                    seq.append((ch, g, cx0 * sx, cx1 * sx, adv, f is lat))
+                    seq.append((ch, g, cx0 * sx, max((cx1 - cx0) * sx, .3) / adv * 100, f is lat))
                 if not seq: continue
-                for c in seq: (alt_text if c[5] else alltext).append(c[0])
-                o = [f'BT /FONT {fs:.3f} Tf 1 0 0 1 {seq[0][2]:.2f} {PH - base:.2f} Tm']; cur = None
-                i = 0
-                while i < len(seq):
-                    isl = seq[i][5]; j = i
-                    while j < len(seq) and seq[j][5] == isl: j += 1
-                    run = seq[i:j]
-                    if isl != cur:
-                        o.append(f'/{"FONT2" if isl else "FONT"} {fs:.3f} Tf'); cur = isl
-                    total_cell = max(run[-1][3] - run[0][2], .3)
-                    total_adv = sum(c[4] for c in run)
-                    tz = total_cell / total_adv * 100 if total_adv > 0 else 100.0
-                    o.append(f'{tz:.2f} Tz <{"".join(f"{c[1]:04x}" for c in run)}>Tj')
-                    i = j
+                for c in seq: (alt_text if c[4] else alltext).append(c[0])
+                o = [f'BT /FONT {fs:.3f} Tf 1 0 0 1 {seq[0][2]:.2f} {PH - base:.2f} Tm']; cur = False
+                for ch, g, x, tz, isl in seq:
+                    if isl != cur: o.append(f'/{"FONT2" if isl else "FONT"} {fs:.3f} Tf'); cur = isl
+                    o.append(f'{tz:.2f} Tz <{g:04x}>Tj')
                 ops.append('\n'.join(o) + '\nET')
         if not ops: continue
         old = set(page.get_contents())
