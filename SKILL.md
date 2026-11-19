@@ -1,6 +1,6 @@
 ---
 name: zoned-ocr
-description: 把扫描版（中文为主、夹英文，简繁皆可；支持横向双页扫描、多栏、含图表的页面）书页PDF做成可复制/搜索/高亮的PDF：原图不动，叠加逐字对齐的隐形文字层；正文与书眉、边码、脚注、页码分区（拖选正文不夹带）；OCR后按上下文人工校对；标点按中英文语境全角/半角；自动章节书签与印刷页码页标签；可出 Zotero 专用版。用户要OCR扫描件、做可搜索PDF、修正PDF复制/高亮问题时使用。
+description: 把扫描版（中文书夹英文、简繁皆可，或英文书；支持横向双页扫描、多栏、含图表的页面）书页PDF做成可复制/搜索/高亮的PDF：原图不动，叠加逐字对齐的隐形文字层；正文与书眉、边码、脚注、页码分区（拖选正文不夹带）；OCR后按上下文人工校对；标点按中英文语境全角/半角；自动章节书签与印刷页码页标签；可出 Zotero 专用版。用户要OCR扫描件、做可搜索PDF、修正PDF复制/高亮问题时使用。
 ---
 
 # ZonedOCR（分区 OCR）：扫描书页 → 分区文字层 PDF
@@ -8,6 +8,12 @@ description: 把扫描版（中文为主、夹英文，简繁皆可；支持横�
 工具：同目录 `zonedocr.py`（单文件，子命令见文件头注释），校对模板 `corrections.example.py`。
 依赖：`pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow`；poppler-utils（pdftotext）。
 不要用 tesseract 做中文：RapidOCR（PaddleOCR 模型）对中文书页准确得多。
+
+## 开始前一次问清（之后不再打扰用户）
+在开工时用一条消息问用户两件事，之后全流程自己跑完、不再询问：
+- 要不要 Zotero 优化版（在 Zotero 里阅读/高亮/复制时用）？默认否。
+- 要不要识别目录大纲（自动章节书签）？默认要。
+答案写进 config.json 的 `zotero`、`toc`；命令行一键：`python3 zonedocr.py run book.pdf [WORK] --zotero|--no-zotero --toc|--no-toc`（不带参数且在终端运行时会交互询问）。
 
 ## 流程
 1. 建作业目录 WORK，写 `config.json`，最少 `{"src": "原PDF", "out": "out.pdf"}`。可选键：
@@ -52,6 +58,11 @@ description: 把扫描版（中文为主、夹英文，简繁皆可；支持横�
 - 引文等缩排段：行尾与上下行右端对齐也算没断段（Zotero 版加连字符）。
 - 页标签：从页码区（没有则书眉里的纯数字，支持罗马数字）算偏移，前后一致纠错，缺页沿用，偏移变化处分段；页码文字层统一成推算值，漏识别的页码自动补上。
 - 书签：同一行碎片先合并，匹配 toc_patterns 且居中或字号大于正文1.3倍，或字号>1.5倍且居中；层级去跳级。
+
+## 英文书
+- `lang` 自动判断（OCR 结果中文字 <15% 视为英文书），也可在 config 写 `"lang": "en"`。
+- 英文模式：正文里紧跟词尾或句末标点的 1–2 位数转上标脚注号；脚注行保留"1. See"格式（半角空格）；"CHAPTER 9"与下一行居中章名合并成一个书签，居中独立的标题行算二级书签；Zotero 版只在中文行尾加隐形连字符，英文行尾不加（否则 Zotero 会把行尾和下一行首的词粘在一起）。
+- 校对重点换成英文常见误识：rn↔m、l↔1、O↔0、断词连字符、斜体书名中的字母。
 
 ## Zotero（用户用 Zotero 时出 `build --zotero`）
 Zotero 阅读器的固有行为（zotero/reader selection.js、zotero/pdf.js normalizeChar、structure.js）：

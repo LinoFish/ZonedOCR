@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""ZonedOCR（分区 OCR）— 扫描版中文书页 → 分区隐形文字层 PDF（可复制/搜索/高亮）
+"""ZonedOCR（分区 OCR）— 扫描版中文/英文书页 → 分区隐形文字层 PDF（可复制/搜索/高亮）
 
-用法（在作业目录 WORK 下放 config.json，可选 corrections.py）:
+一条命令跑完（开头问两个问题：要不要 Zotero 优化版、要不要识别目录大纲，之后不再打扰）:
+  python3 zonedocr.py run book.pdf [WORK] [--zotero|--no-zotero] [--toc|--no-toc]
+
+分步（在作业目录 WORK 下放 config.json，可选 corrections.py）:
   python3 zonedocr.py WORK images     # 抽出/渲染页面图
   python3 zonedocr.py WORK ocr        # RapidOCR 行+逐字框 -> words.json（最慢，约1页/秒）
   python3 zonedocr.py WORK classify   # 分区 -> lines.json，打印每页统计、疑似漏行、低置信行
@@ -17,12 +20,41 @@
 import sys, os, re, json, glob, statistics, difflib, importlib.util, subprocess, tempfile
 from collections import Counter
 
+def ask(q, default):
+    """开头的是/否问题；非交互（管道、AI 代理）时用默认值"""
+    if not sys.stdin.isatty(): return default
+    a = input(f'{q} [{"Y/n" if default else "y/N"}] ').strip().lower()
+    return default if not a else a.startswith('y') or a in ('是', '要', '好')
+
+def cmd_run():
+    """run book.pdf [WORK]：开头一次问清选项，然后 images→ocr→classify→proof→build→check 一路跑完"""
+    a = [x for x in sys.argv[2:] if not x.startswith('--')]; fl = sys.argv[2:]
+    if not a: sys.exit('用法: zonedocr.py run book.pdf [WORK]')
+    src = os.path.abspath(a[0]); base = os.path.splitext(os.path.basename(src))[0]
+    work = os.path.abspath(a[1] if len(a) > 1 else base + '_work')
+    pick = lambda on, off, q, d: True if on in fl else False if off in fl else ask(q, d)
+    zot = pick('--zotero', '--no-zotero', '要 Zotero 优化版吗？（在 Zotero 里阅读、高亮、复制时用）', False)
+    toc = pick('--toc', '--no-toc', '要识别目录大纲（章节书签）吗？', True)
+    os.makedirs(work, exist_ok=True); cf = os.path.join(work, 'config.json')
+    cfg = json.load(open(cf)) if os.path.exists(cf) else {}
+    cfg.update({'src': src, 'out': base + ('_OCR_Zotero.pdf' if zot else '_OCR.pdf'), 'zotero': zot, 'toc': toc})
+    json.dump(cfg, open(cf, 'w'), ensure_ascii=False, indent=1)
+    print(f'作业目录 {work}；Zotero 版：{"是" if zot else "否"}；目录大纲：{"是" if toc else "否"}', flush=True)
+    me = os.path.abspath(__file__)
+    for step in (['images'], ['ocr'], ['classify'], ['proof'], ['build'], ['check']):
+        print(f'== {step[0]}', flush=True); subprocess.run([sys.executable, me, work] + step, check=True)
+    print(f'完成：{os.path.join(work, cfg["out"])}\n要提高准确度：对照 {work}/proof/ 写 corrections.py，再运行 build。')
+
+if len(sys.argv) > 1 and sys.argv[1] == 'run':
+    cmd_run(); sys.exit()
 WORK = os.path.abspath(sys.argv[1]); CMD = sys.argv[2]; ARGS = sys.argv[3:]
 CFG = {
     "src": None,               # 原PDF路径（必填）
     "out": "out.pdf",          # 输出（相对 WORK）
     "page_offset": None,       # 印刷页码 = PDF页序 + page_offset；None = 由各页页码自动推算（页标签、补缺页码）
     "toc": True,               # 自动识别章节标题写入PDF书签
+    "zotero": False,           # build 默认出 Zotero 优化版（run 开头询问后写入）
+    "lang": None,              # 'zh' / 'en'；None = 按 OCR 结果里中文字比例自动判断
     "toc_patterns": [          # (正则, 层级)；另外：明显大于正文字号的行视为1级标题
         [r"^第[一二三四五六七八九十百零〇\d]+[部篇编]", 1],
         [r"^第[一二三四五六七八九十百零〇\d]+章", 1],
@@ -30,7 +62,10 @@ CFG = {
         [r"^[一二三四五六七八九十百]+[　 、]\S", 2],
         [r"^\d+(\.\d+)*[　 ]\S", 2],
         [r"^[（(][一二三四五六七八九十]+[）)]\S", 3],
-        [r"^\d+[.．、]\s*\S", 3]
+        [r"^\d+[.．、]\s*\S", 3],
+        [r"(?i)^(part|book)\s+([\dIVXLC]+|one|two|three|four|five|six|seven|eight|nine|ten)\b", 1],
+        [r"(?i)^chapter\s+([\dIVXLC]+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b", 1],
+        [r"^[A-Z][A-Za-z'’,:\- ]{2,60}$", 2]
     ],
     "header_band": 0.10,       # 页顶此比例内为书眉
     "folio_band": 0.90,        # 页底此比例以下、且≤4字符为页码
@@ -44,6 +79,14 @@ CFG.update(json.load(open(os.path.join(WORK, 'config.json'))))
 if CFG['src'] and not os.path.isabs(CFG['src']) and os.path.exists(os.path.join(WORK, CFG['src'])):
     CFG['src'] = os.path.join(WORK, CFG['src'])   # src 相对作业目录也可以
 IMG = os.path.join(WORK, 'images')
+
+def lang():
+    """书的主语言：config lang，否则按 words.json 里中日韩字比例（<15% 算英文书）"""
+    if CFG.get('lang'): return CFG['lang']
+    try: t = ''.join(r['text'] for rows in json.load(open(J('words.json'))).values() for r in rows)
+    except Exception: return 'zh'
+    c = len(re.findall(r'[\u3400-\u9fff]', t)); return 'en' if c < .15 * max(1, len(re.findall(r'\w', t))) else 'zh'
+
 J = lambda n: os.path.join(WORK, n)
 
 def load_corr():
@@ -511,7 +554,11 @@ def apply_rules(rules, t):
         t = re.sub(a[3:], b, t) if a.startswith('re:') else t.replace(a, b)
     return t
 
+SUP = str.maketrans('0123456789', '⁰¹²³⁴⁵⁶⁷⁸⁹')
+
 def final_pages():
+    global EN
+    EN = lang() == 'en'
     P = json.load(open(J('lines.json'))); R, ADD, HEADER = load_corr(); pages = {}
     for pg_s, p in P.items():
         pg = int(pg_s); lines = [dict(l) for l in p['lines']]
@@ -535,7 +582,11 @@ def final_pages():
                 t = apply_rules(R.get(0, []), t)   # R[0]=全书通用规则，先做；页规则在其后，可以把个别处改回
                 t = apply_rules(R.get(pg, []), t)
                 t = normalize(t)
-                if l['kind'] == 'note': t = re.sub(r'^(\d{1,3})(?![\d])[\s　]*(?=\S)', r'\1　', t)   # 脚注号后全角空格；(?![\d])防回溯把独立成行的两位数号拆成“2　3”
+                if l['kind'] == 'note':
+                    if EN: t = re.sub(r'^(\d{1,3})(?!\d)\s*([.)])?\s*(?=\S)', lambda m: m[1] + (m[2] or '') + ' ', t)   # 英文书："1. See"
+                    else: t = re.sub(r'^(\d{1,3})(?![\d])[\s　]*(?=\S)', r'\1　', t)
+                elif EN and l['kind'] == 'body':   # 英文正文：紧跟词尾/句末标点的 1–2 位数是脚注号 → 上标
+                    t = re.sub(r'(?<=[a-z][.,;:!?’”"\)])(\d{1,2})(?=\s|$)|(?<=[a-z]{2})(\d{1,2})(?=\s|$)', lambda m: (m[1] or m[2]).translate(SUP), t)   # 脚注号后全角空格；(?![\d])防回溯把独立成行的两位数号拆成“2　3”
             l['text'] = t
         pages[pg] = layout_lines({'w': p['w'], 'h': p['h'], 'lines': lines, 'rule_y': p.get('rule_y'),
                                   'regions': p.get('regions'), 'cols': p.get('cols'), 'figs': p.get('figs', [])})
@@ -651,17 +702,22 @@ def detect_toc(pages):
             gap_up = ycs[ri] - ycs[ri - 1] if ri and rows[ri - 1]['key'] == r['key'] else 9e9
             gap_dn = ycs[ri + 1] - ycs[ri] if ri + 1 < len(rows) and rows[ri + 1]['key'] == r['key'] else 9e9
             isolated = gap_up > 1.5 * pitch and gap_dn > 1.4 * pitch   # 标题上下都有空行
-            text = re.sub(r'\s+', '　', '　'.join(l['text'].strip() for l in ls)).strip('　')
+            sp = ' ' if EN else '　'
+            text = re.sub(r'\s+', sp, sp.join(l['text'].strip() for l in ls)).strip()
             text = re.sub(r'(?<=[\u4e00-\u9fff])　(?=[\u4e00-\u9fff]$)', '', text)  # "章　名"末字被拆开
             x0 = min(l['box'][0] for l in ls); x1 = max(l['box'][2] for l in ls)
             h = max(l['box'][3] - l['box'][1] for l in ls)
-            if len(text) > 30 or re.search(r'[。；，：]$', text): continue
+            if len(text) > (70 if EN else 30) or re.search(r'[。；，：.,;:]$', text): continue
             centered = abs((x0 + x1) / 2 - (bx[0] + bx[1]) / 2) < BW * .08 and (x1 - x0) < BW * .6
             lvl = None
             for pat, lv in CFG['toc_patterns']:
                 if re.search(pat, text) and (centered or h > 1.3 * H or (isolated and x1 - x0 < BW * .6)): lvl = lv; break
             if lvl is None and h > 1.5 * H and centered: lvl = 1
+            if lvl and EN and lvl > 1 and not (centered and (isolated or h > 1.15 * H)): lvl = None   # 英文二级标题须居中独立
             if lvl:
+                if toc and toc[-1][2] == pg and re.match(r'(?i)^(chapter|part|book)\s+\S+$', toc[-1][1]) and ri and rows[ri - 1] is not r \
+                        and ycs[ri] - ycs[ri - 1] < 3 * pitch and centered:   # "CHAPTER 9" 下一行的章名并进同一书签
+                    toc[-1][1] += ' ' + text; continue
                 toc.append([lvl, text, pg, {'kind': 1, 'to': None, 'top': min(l['box'][1] for l in ls) / p['h']}])
     for lvl, title, pg in reversed(CFG.get('toc_extra', [])):   # 手工补的书签（如图片式章名页），同页被它包含的自动书签去掉
         toc = [t for t in toc if not (t[2] == pg and title.replace('　', '').startswith(t[1].replace('　', '')))]
@@ -681,7 +737,7 @@ def cmd_toc():
 
 def cmd_build():
     import pymupdf
-    zot = '--zotero' in ARGS; dbg = '--debug' in ARGS
+    zot = ('--zotero' in ARGS or CFG.get('zotero')) and '--no-zotero' not in ARGS; dbg = '--debug' in ARGS
     out = J(ARGS[ARGS.index('--out') + 1]) if '--out' in ARGS else J(CFG['out'])
     pages = final_pages(); Wd = json.load(open(J('words.json')))
     cjk = pymupdf.Font('cjk'); lat = pymupdf.Font('notos')
@@ -765,7 +821,8 @@ def cmd_build():
                 # 改写成 U+2002（Zotero NFKD 后仍是普通空格；不用 U+00A0，Droid 的 NBSP 会让 Chrome/PDFium 高亮断开）
                 if zot: text = text.replace(' ', '\u2002')
                 colR = l.get('colR') or RIGHT; colW = l['bx'][1] - l['bx'][0]
-                if zot and kind in ('body', 'note') and cp and l['box'][2] > min(colR, localR) - 1.2 * KIND_H[kind] and l['box'][2] - l['box'][0] > .6 * colW:
+                # 行尾隐形连字符只加在中文行尾：英文行尾是词间，Zotero 去掉"‐+空格"会把两个词粘在一起
+                if zot and kind in ('body', 'note') and cp and (re.match(r'[\u3400-\u9fff，。、；：？！）》」』—…]', text[-1]) or (not EN and text[-1] in '”’')) and l['box'][2] > min(colR, localR) - 1.2 * KIND_H[kind] and l['box'][2] - l['box'][0] > .6 * colW:
                     text += '\u2010'; cp = cp + [(cp[-1][1], cp[-1][1] + 2)]
                 seq = []
                 for ch, (cx0, cx1) in zip(text, cp):
@@ -803,7 +860,7 @@ def cmd_build():
         doc.update_stream(xs[0], ('q\n' + head + stream + '\nQ\n').encode())
     lab, ranges = page_labels(pages)   # 页标签=印刷页码，Zotero/阅读器引用时用
     if ranges: doc.set_page_labels(ranges); print('page labels', ranges)
-    if CFG['toc']:
+    if CFG['toc'] and '--no-toc' not in ARGS:
         toc = detect_toc(pages); items = []
         for lvl, title, pg, d in toc:
             pr = doc[pg - 1].rect
