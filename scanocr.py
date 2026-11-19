@@ -743,9 +743,10 @@ def cmd_build():
         page = doc[pg - 1]; sx = page.rect.width / p['w']; sy = page.rect.height / p['h']; PH = page.rect.height
         kinds = ['body', 'note', 'figs'] if zot else WRITE_ORDER
         if '--kinds' in ARGS: kinds = ARGS[ARGS.index('--kinds') + 1].split(',')
-        # 每行一个 BT…ET；行内每字只写 "Tz <gid>Tj"：Tz=字框宽/字形宽，字框首尾相接，所以顺序前进正好落在原图位置。
-        # 不要改成整段一个 Tz：中文全角、英文比例字宽和扫描字形宽度不成比例，整段缩放会偏移到一两个字宽，高亮对不上原图；
-        # 阅读器（pdf.js/Zotero）不会因 Tz 变化拆行。英文词间高亮断开是 Zotero 丢弃 U+0020 所致，Zotero 版已改写成 U+00A0。
+        # 每行一个 BT…ET；行内切成若干段，每段一个 Tj、一个 Tz（段宽=字框总宽）。段尽量长：只要段内每个字
+        # 按统一缩放后的位置与自己字框的偏差 ≤ 0.15 字宽就继续延长，所以高亮仍对得上原图。
+        # 不逐字 Tj：Chrome/PDFium 每个文字对象单独一块高亮，逐字写会让高亮碎成一格一格、英文词间断开。
+        # 也不用 TJ 字距校正：字距大了 pdftotext/pdf.js 会插入假空格。
         # 整页一个字体资源。先用 TextWriter 写同样的字让 PyMuPDF 登记字体和 ToUnicode，再把它生成的流换成我们的。
         ops, alltext, alt_text = [], [], []
         for kind in kinds:   # 写入顺序=选择顺序；正文先写，其它区排在后面
@@ -761,8 +762,8 @@ def cmd_build():
                 base = yc + (cjk.ascender + cjk.descender) / 2 * fs
                 text, cp = l['text'], positions(pg, l)
                 # Zotero 丢掉 U+0020 字形，只按字距推断空格，留下的空隙会让高亮/选择在英文词间断开；
-                # 改写成 U+00A0（Zotero NFKD 后仍是普通空格，字框连续，复制只出一个空格）
-                if zot: text = text.replace(' ', '\u00a0')
+                # 改写成 U+2002（Zotero NFKD 后仍是普通空格；不用 U+00A0，Droid 的 NBSP 会让 Chrome/PDFium 高亮断开）
+                if zot: text = text.replace(' ', '\u2002')
                 colR = l.get('colR') or RIGHT; colW = l['bx'][1] - l['bx'][0]
                 if zot and kind in ('body', 'note') and cp and l['box'][2] > min(colR, localR) - 1.2 * KIND_H[kind] and l['box'][2] - l['box'][0] > .6 * colW:
                     text += '\u2010'; cp = cp + [(cp[-1][1], cp[-1][1] + 2)]
@@ -771,13 +772,24 @@ def cmd_build():
                     f = cjk if cjk.has_glyph(ord(ch)) else lat   # Droid 缺的（⁴⁵⁶…）用 Noto 补
                     g = f.has_glyph(ord(ch)); adv = f.glyph_advance(ord(ch)) * fs
                     if not g or adv <= 0: continue
-                    seq.append((ch, g, cx0 * sx, max((cx1 - cx0) * sx, .3) / adv * 100, f is lat))
+                    seq.append((ch, g, cx0 * sx, max((cx1 - cx0) * sx, .3), adv, f is lat))
                 if not seq: continue
-                for c in seq: (alt_text if c[4] else alltext).append(c[0])
-                o = [f'BT /FONT {fs:.3f} Tf 1 0 0 1 {seq[0][2]:.2f} {PH - base:.2f} Tm']; cur = False
-                for ch, g, x, tz, isl in seq:
+                for c in seq: (alt_text if c[5] else alltext).append(c[0])
+                o = [f'BT /FONT {fs:.3f} Tf 1 0 0 1 {seq[0][2]:.2f} {PH - base:.2f} Tm']; cur = None; i = 0
+                tol = .35 * statistics.median(c[3] for c in seq)
+                def fits(run):   # 统一缩放后各字起点与字框起点的最大偏差
+                    th = sum(c[3] for c in run) / sum(c[4] for c in run); x = 0; w = 0
+                    for c in run:
+                        if abs(x - w) > tol: return False
+                        x += c[4] * th; w += c[3]
+                    return True
+                while i < len(seq):
+                    isl = seq[i][5]; j = i + 1
+                    while j < len(seq) and seq[j][5] == isl and fits(seq[i:j + 1]): j += 1
+                    run = seq[i:j]; i = j
                     if isl != cur: o.append(f'/{"FONT2" if isl else "FONT"} {fs:.3f} Tf'); cur = isl
-                    o.append(f'{tz:.2f} Tz <{g:04x}>Tj')
+                    th = sum(c[3] for c in run) / sum(c[4] for c in run)
+                    o.append(f'{th * 100:.2f} Tz <{"".join(f"{c[1]:04x}" for c in run)}>Tj')
                 ops.append('\n'.join(o) + '\nET')
         if not ops: continue
         old = set(page.get_contents())
