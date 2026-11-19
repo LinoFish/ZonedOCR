@@ -1,11 +1,11 @@
 ---
-name: scan-ocr-pdf
+name: zoned-ocr
 description: 把扫描版（中文为主、夹英文，简繁皆可；支持横向双页扫描、多栏、含图表的页面）书页PDF做成可复制/搜索/高亮的PDF：原图不动，叠加逐字对齐的隐形文字层；正文与书眉、边码、脚注、页码分区（拖选正文不夹带）；OCR后按上下文人工校对；标点按中英文语境全角/半角；自动章节书签与印刷页码页标签；可出 Zotero 专用版。用户要OCR扫描件、做可搜索PDF、修正PDF复制/高亮问题时使用。
 ---
 
-# 扫描书页 → 分区文字层 PDF
+# ZonedOCR（分区 OCR）：扫描书页 → 分区文字层 PDF
 
-工具：同目录 `scanocr.py`（单文件，子命令见文件头注释），校对模板 `corrections.example.py`。
+工具：同目录 `zonedocr.py`（单文件，子命令见文件头注释），校对模板 `corrections.example.py`。
 依赖：`pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow`；poppler-utils（pdftotext）。
 不要用 tesseract 做中文：RapidOCR（PaddleOCR 模型）对中文书页准确得多。
 
@@ -19,20 +19,20 @@ description: 把扫描版（中文为主、夹英文，简繁皆可；支持横�
    - `rec`：识别模型，默认 v6（另可 v5、v4）；`dash_fix` true：用 v5 补回 v6 漏掉的破折号。
    - `spread` "auto"：横向双页（页宽>1.15倍页高）自动按中缝拆成左右两页处理；`false` 关闭。
    - `columns` "auto"：自动分栏；`1` 关闭。`figures` true：识别图表区。
-2. `python3 scanocr.py WORK images` → `ocr`（约1页/秒，页多时放后台）→ `classify`。600dpi 大图会自动缩到长边约2800px。
+2. `python3 zonedocr.py WORK images` → `ocr`（约1页/秒，页多时放后台）→ `classify`。600dpi 大图会自动缩到长边约2800px。
 3. 看 classify 的每页统计：
    - 版面摘要：`双页`、`2栏`、`figure[框]`、`table[框]`。分栏/图表判错就用 config 关掉或改 corrections。
    - `rule None` 但页面有脚注 → 先看是否自动识别了（页底"数字+空格"开头、上方有空行的行块会当脚注）；不行就看图写 `rule_override`（双页的右页键写 "页序.1"）。
-   - `GAPS` → `scanocr.py WORK gaps` 打印重识别候选，对图确认后放进 corrections.ADD（也可能只是标题或段间距）。
+   - `GAPS` → `zonedocr.py WORK gaps` 打印重识别候选，对图确认后放进 corrections.ADD（也可能只是标题或段间距）。
    - `LOW` 低置信行：插图、噪点页上的乱码，用 R 删掉或核对。
-4. 校对（不能省）：`scanocr.py WORK proof` 生成每页文本（按最终写入顺序排列，标 p1/p2=双页左右、c1/c2=栏），逐页看图对照（一次一两页），把错误写进 `WORK/corrections.py` 的 R（按页的 原片段→改正；R[0] 全书通用；'re:' 开头为正则）。重点：
+4. 校对（不能省）：`zonedocr.py WORK proof` 生成每页文本（按最终写入顺序排列，标 p1/p2=双页左右、c1/c2=栏），逐页看图对照（一次一两页），把错误写进 `WORK/corrections.py` 的 R（按页的 原片段→改正；R[0] 全书通用；'re:' 开头为正则）。重点：
    - 形近误识：入↔人（闯入、进入、导入、纳入）、暧昧↔暖昧、自己↔自已、啻↔童、生僻字被丢或替换。
    - 破折号被识成"一一"→"——"；连接号"—"。
    - 脚注号：正文里的 1、"、°、” 往往是上标注码，改成 ¹²³（模板里的 s(n)）；脚注行号后加全角空格。
    - 原书本身的错字保留不改，告诉用户。
    - 片段取长一点保证唯一；build 会打印 `MISS` 未命中的规则，必须清零。
-5. `scanocr.py WORK toc` 预览书签和页标签；`build` 出标准版；`build --debug --out dbg.pdf` 出红色可见文字核对对位；`overlay 2,13` 看高亮框是否平整。
-6. `scanocr.py WORK check` → 无"中文间空格"、"中文旁半角标点"、"疑似误识"。
+5. `zonedocr.py WORK toc` 预览书签和页标签；`build` 出标准版；`build --debug --out dbg.pdf` 出红色可见文字核对对位；`overlay 2,13` 看高亮框是否平整。
+6. `zonedocr.py WORK check` → 无"中文间空格"、"中文旁半角标点"、"疑似误识"。
 7. 交付 PDF。说明：原扫描图+隐形文字层、已校对、改了哪些类错误。
 
 ## 繁体/旧字形书

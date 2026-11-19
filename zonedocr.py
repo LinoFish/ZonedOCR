@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""scanocr — 扫描版中文书页 → 分区隐形文字层 PDF（可复制/搜索/高亮）
+"""ZonedOCR（分区 OCR）— 扫描版中文书页 → 分区隐形文字层 PDF（可复制/搜索/高亮）
 
 用法（在作业目录 WORK 下放 config.json，可选 corrections.py）:
-  python3 scanocr.py WORK images     # 抽出/渲染页面图
-  python3 scanocr.py WORK ocr        # RapidOCR 行+逐字框 -> words.json（最慢，约1页/秒）
-  python3 scanocr.py WORK classify   # 分区 -> lines.json，打印每页统计、疑似漏行、低置信行
-  python3 scanocr.py WORK gaps       # 对疑似漏行空隙裁图重识别，打印 ADD 候选
-  python3 scanocr.py WORK toc        # 预览自动识别的章节书签和页标签
-  python3 scanocr.py WORK proof      # 写 proof/pNNN.txt 供逐页对图校对
-  python3 scanocr.py WORK build [--zotero] [--debug] [--kinds body,note] [--out X.pdf]
-  python3 scanocr.py WORK check [PDF] # 抽文字检查空格/标点/常见误识/校对规则命中
-  python3 scanocr.py WORK overlay 2,13 [PDF]  # 渲染字符高亮框叠加图到 WORK/overlay/
+  python3 zonedocr.py WORK images     # 抽出/渲染页面图
+  python3 zonedocr.py WORK ocr        # RapidOCR 行+逐字框 -> words.json（最慢，约1页/秒）
+  python3 zonedocr.py WORK classify   # 分区 -> lines.json，打印每页统计、疑似漏行、低置信行
+  python3 zonedocr.py WORK gaps       # 对疑似漏行空隙裁图重识别，打印 ADD 候选
+  python3 zonedocr.py WORK toc        # 预览自动识别的章节书签和页标签
+  python3 zonedocr.py WORK proof      # 写 proof/pNNN.txt 供逐页对图校对
+  python3 zonedocr.py WORK build [--zotero] [--debug] [--kinds body,note] [--out X.pdf]
+  python3 zonedocr.py WORK check [PDF] # 抽文字检查空格/标点/常见误识/校对规则命中
+  python3 zonedocr.py WORK overlay 2,13 [PDF]  # 渲染字符高亮框叠加图到 WORK/overlay/
 
 依赖: pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow ; poppler-utils
 """
