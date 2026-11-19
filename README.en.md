@@ -10,6 +10,7 @@ Ordinary OCR only makes a scanned book searchable. ZonedOCR understands the page
 - **Smart zoning**: body text, footnotes, figures, running headers, margin numbers and folios are written as separate zones, so selecting body text never drags in headers, page numbers or notes
 - **Printed page numbers**: detects the book's own page numbers and writes them as PDF page labels (Roman-numeral front matter included), so Zotero and other readers cite the original pages; misread folios are corrected from neighbouring pages
 - **Automatic bookmarks**: chapter and section headings become an outline
+- **Orientation & deskew**: upside-down or sideways pages (90°/180°/270°) are detected and small skews straightened; the output PDF uses the corrected page images
 - **Complex layouts**: two-page landscape scans are split; multi-column pages copy column by column; figures and captions are grouped
 - **Character-level alignment**: highlights sit on the scanned glyphs and stay continuous in browsers and Zotero
 - **Proofreading pass**: page-by-page corrections against the image (`corrections.py`); punctuation set to full- or half-width by Chinese/English context
@@ -27,16 +28,17 @@ The first run downloads the PP-OCRv6 medium recognition model (~77 MB); PP-OCRv5
 
 ## Usage
 
-One command does everything. It asks two questions up front — whether you want the Zotero edition and whether to detect the table of contents — and then runs unattended:
+One command does everything. It asks three questions up front — Zotero edition, table-of-contents detection, and orientation/deskew — and then runs unattended:
 
 ```bash
 python3 zonedocr.py run book.pdf
 # 要 Zotero 优化版吗？... [y/N] y        (Zotero edition?)
 # 要识别目录大纲（章节书签）吗？ [Y/n]    (Detect TOC / bookmarks?)
+# 要自动识别页面方向、扶正歪斜的页面吗？ [Y/n]  (Fix orientation & skew?)
 # … 完成：book_work/book_OCR_Zotero.pdf
 ```
 
-Skip the questions with flags: `--zotero` / `--no-zotero`, `--toc` / `--no-toc`.
+Skip the questions with flags: `--zotero` / `--no-zotero`, `--toc` / `--no-toc`, `--deskew` / `--no-deskew`.
 
 For higher accuracy, proofread against the per-page text in `book_work/proof/`, write `corrections.py`, then run `python3 zonedocr.py book_work build`. The individual steps (images / ocr / classify / proof / build / check) are described in SKILL.md.
 

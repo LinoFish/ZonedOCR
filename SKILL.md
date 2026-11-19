@@ -10,10 +10,11 @@ description: 把扫描版（中文书夹英文、简繁皆可，或英文书；�
 不要用 tesseract 做中文：RapidOCR（PaddleOCR 模型）对中文书页准确得多。
 
 ## 开始前一次问清（之后不再打扰用户）
-在开工时用一条消息问用户两件事，之后全流程自己跑完、不再询问：
+在开工时用一条消息问用户三件事，之后全流程自己跑完、不再询问：
 - 要不要 Zotero 优化版（在 Zotero 里阅读/高亮/复制时用）？默认否。
 - 要不要识别目录大纲（自动章节书签）？默认要。
-答案写进 config.json 的 `zotero`、`toc`；命令行一键：`python3 zonedocr.py run book.pdf [WORK] --zotero|--no-zotero --toc|--no-toc`（不带参数且在终端运行时会交互询问）。
+- 要不要自动识别页面方向、扶正歪斜页面？默认要（每页多花约 20 秒）。
+答案写进 config.json 的 `zotero`、`toc`、`deskew`；命令行一键：`python3 zonedocr.py run book.pdf [WORK] --zotero|--no-zotero --toc|--no-toc --deskew|--no-deskew`（不带参数且在终端运行时会交互询问）。
 
 ## 流程
 1. 建作业目录 WORK，写 `config.json`，最少 `{"src": "原PDF", "out": "out.pdf"}`。可选键：

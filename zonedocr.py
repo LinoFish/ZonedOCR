@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """ZonedOCR（分区 OCR）— 扫描版中文/英文书页 → 分区隐形文字层 PDF（可复制/搜索/高亮）
 
-一条命令跑完（开头问两个问题：要不要 Zotero 优化版、要不要识别目录大纲，之后不再打扰）:
-  python3 zonedocr.py run book.pdf [WORK] [--zotero|--no-zotero] [--toc|--no-toc]
+一条命令跑完（开头问三个问题：要不要 Zotero 优化版、目录大纲、方向纠正，之后不再打扰）:
+  python3 zonedocr.py run book.pdf [WORK] [--zotero|--no-zotero] [--toc|--no-toc] [--deskew|--no-deskew]
 
 分步（在作业目录 WORK 下放 config.json，可选 corrections.py）:
   python3 zonedocr.py WORK images     # 抽出/渲染页面图
@@ -35,11 +35,12 @@ def cmd_run():
     pick = lambda on, off, q, d: True if on in fl else False if off in fl else ask(q, d)
     zot = pick('--zotero', '--no-zotero', '要 Zotero 优化版吗？（在 Zotero 里阅读、高亮、复制时用）', False)
     toc = pick('--toc', '--no-toc', '要识别目录大纲（章节书签）吗？', True)
+    desk = pick('--deskew', '--no-deskew', '要自动识别页面方向、扶正歪斜的页面吗？', True)
     os.makedirs(work, exist_ok=True); cf = os.path.join(work, 'config.json')
     cfg = json.load(open(cf)) if os.path.exists(cf) else {}
-    cfg.update({'src': src, 'out': base + ('_OCR_Zotero.pdf' if zot else '_OCR.pdf'), 'zotero': zot, 'toc': toc})
+    cfg.update({'src': src, 'out': base + ('_OCR_Zotero.pdf' if zot else '_OCR.pdf'), 'zotero': zot, 'toc': toc, 'deskew': desk})
     json.dump(cfg, open(cf, 'w'), ensure_ascii=False, indent=1)
-    print(f'作业目录 {work}；Zotero 版：{"是" if zot else "否"}；目录大纲：{"是" if toc else "否"}', flush=True)
+    print(f'作业目录 {work}；Zotero 版：{"是" if zot else "否"}；目录大纲：{"是" if toc else "否"}；方向纠正：{"是" if desk else "否"}', flush=True)
     me = os.path.abspath(__file__)
     for step in (['images'], ['ocr'], ['classify'], ['proof'], ['build'], ['check']):
         print(f'== {step[0]}', flush=True); subprocess.run([sys.executable, me, work] + step, check=True)
@@ -53,6 +54,7 @@ CFG = {
     "out": "out.pdf",          # 输出（相对 WORK）
     "page_offset": None,       # 印刷页码 = PDF页序 + page_offset；None = 由各页页码自动推算（页标签、补缺页码）
     "toc": True,               # 自动识别章节标题写入PDF书签
+    "deskew": False,           # images 后自动识别页面方向（90/180/270）并纠正小角度倾斜，输出用扶正后的页面图
     "zotero": False,           # build 默认出 Zotero 优化版（run 开头询问后写入）
     "lang": None,              # 'zh' / 'en'；None = 按 OCR 结果里中文字比例自动判断
     "toc_patterns": [          # (正则, 层级)；另外：明显大于正文字号的行视为1级标题
@@ -120,6 +122,50 @@ def cmd_images():
         else:
             page.get_pixmap(dpi=CFG['render_dpi']).save(out)
     print('pages', len(doc))
+    if CFG.get('deskew'): cmd_deskew()
+
+def skew_angle(im):
+    """小角度倾斜：二值化后在 ±5° 内找使行投影最"尖"（相邻行差的方差最大）的角度"""
+    import numpy as np
+    from PIL import Image
+    g = im.convert('L'); r = 1600 / max(g.size); g = g.resize((int(g.width * r), int(g.height * r)))
+    a = np.array(g); b = Image.fromarray(((a < min(160, a.mean() - 30)) * 255).astype('uint8'))
+    def score(t):
+        rows = np.array(b.rotate(t, resample=Image.BILINEAR)).sum(1).astype(float); return np.var(np.diff(rows))
+    best = max(np.arange(-5, 5.01, .25), key=score)
+    return float(max(np.arange(best - .25, best + .26, .02), key=score))
+
+def orientation(im, eng):
+    """整页方向（逆时针转多少度能扶正：0/90/180/270）。关掉方向分类（use_cls=False），只数横向文字框的 置信度×字数：
+    RapidOCR 会自己把竖长的框转 90° 再识别、cls 会把倒置的行翻正，不关掉的话四个方向分数都高。"""
+    import numpy as np
+    g = im.convert('RGB'); r = 1200 / max(g.size); g = g.resize((int(g.width * r), int(g.height * r)))
+    def score(rot):
+        res, _ = eng(np.array(g.rotate(rot, expand=True))[:, :, ::-1], use_cls=False); s = 0
+        for b, t, c in res or []:
+            w = max(p[0] for p in b) - min(p[0] for p in b); h = max(p[1] for p in b) - min(p[1] for p in b)
+            if c > .6 and w > 1.5 * h: s += c * len(t)
+        return s
+    sc = {0: score(0)}
+    for rot in (180, 90, 270):
+        sc[rot] = score(rot)
+        if rot == 180 and sc[0] > 3 * max(sc[180], 1): break   # 正立明显胜出就不再试 90/270
+    best = max(sc, key=sc.get)
+    return best if sc[best] > 1.3 * sc[0] + 5 else 0
+
+def cmd_deskew():
+    """扶正页面图：方向 + 小角度倾斜；覆盖 images/，记到 orient.json，build 用扶正后的图替换 PDF 页面"""
+    from PIL import Image
+    from rapidocr_onnxruntime import RapidOCR
+    eng = RapidOCR(); log = {}
+    for i, p in enumerate(images(), 1):
+        im = Image.open(p); rot = orientation(im, eng)
+        if rot: im = im.rotate(rot, expand=True)
+        ang = skew_angle(im)
+        if abs(ang) < .15: ang = 0
+        if ang: im = im.rotate(ang, resample=Image.BICUBIC, fillcolor=255 if im.mode == 'L' else (255,) * len(im.getbands()))
+        if rot or ang: im.save(p); log[i] = [rot, round(ang, 2)]; print(i, '旋转', rot, '倾斜', round(ang, 2), flush=True)
+    json.dump(log, open(J('orient.json'), 'w')); print('扶正的页', len(log))
 
 def images():
     return sorted(glob.glob(f'{IMG}/p*.png'))
@@ -216,11 +262,11 @@ def find_rule(im, H, W):
     import numpy as np
     x0, x1 = int(W * .08), int(W * .94)
     for y in range(int(H * .52), int(H * .92)):
-        row = im[y, x0:x1].astype(np.int8)
+        row = (im[y, x0:x1] | im[y + 1, x0:x1]).astype(np.int8)   # 两行合并：扶正后的细线常分在相邻两行
         if row.sum() < W * .08: continue
         d = np.diff(np.concatenate([[0], row, [0]]))
         L = (np.where(d == -1)[0] - np.where(d == 1)[0]).max()
-        if W * .10 < L < W * .32 and row.sum() < L + 40 and im[y-6, x0:x1].sum() < 80 and im[y+6, x0:x1].sum() < 80:
+        if W * .10 < L < W * .32 and row.sum() < L + 40 and im[y-6, x0:x1].sum() < 80 and im[y+7, x0:x1].sum() < 80:
             return y
     return None
 
@@ -795,6 +841,16 @@ def cmd_build():
             page.add_redact_annot(page.rect)
             page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                                   text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+    orient = json.load(open(J('orient.json'))) if os.path.exists(J('orient.json')) else {}
+    for k in orient:   # 扶正过的页：换成扶正后的图（转了 90/270 的页宽高互换）
+        from PIL import Image
+        page = doc[int(k) - 1]; img = f'{IMG}/p{int(k):03d}.png'; im = Image.open(img)
+        w0, h0 = page.rect.width, page.rect.height
+        if (im.width > im.height) != (w0 > h0): w0, h0 = h0, w0
+        jp = img[:-4] + '.jpg'; im.convert('L' if im.mode in ('L', '1') else 'RGB').save(jp, quality=88)
+        page.set_rotation(0)
+        for x in page.get_contents(): doc.update_stream(x, b'')
+        page.set_mediabox(pymupdf.Rect(0, 0, w0, h0)); page.insert_image(page.rect, filename=jp); os.remove(jp)
     for pg, p in pages.items():
         page = doc[pg - 1]; sx = page.rect.width / p['w']; sy = page.rect.height / p['h']; PH = page.rect.height
         kinds = ['body', 'note', 'figs'] if zot else WRITE_ORDER
@@ -896,5 +952,5 @@ def cmd_overlay():
                         p.draw_rect(c['bbox'], color=None, fill=(.2, .5, 1), fill_opacity=.35, overlay=True)
         p.get_pixmap(dpi=90).save(J(f'overlay/p{pn:03d}.png')); print(J(f'overlay/p{pn:03d}.png'))
 
-{'toc': cmd_toc, 'gaps': cmd_gaps, 'images': cmd_images, 'ocr': cmd_ocr, 'classify': cmd_classify, 'proof': cmd_proof,
+{'deskew': cmd_deskew, 'toc': cmd_toc, 'gaps': cmd_gaps, 'images': cmd_images, 'ocr': cmd_ocr, 'classify': cmd_classify, 'proof': cmd_proof,
  'build': cmd_build, 'check': cmd_check, 'overlay': cmd_overlay}[CMD]()
