@@ -56,6 +56,7 @@ description: 把扫描版（中文为主、夹英文，简繁皆可；支持横�
 ## Zotero（用户用 Zotero 时出 `build --zotero`）
 Zotero 阅读器的固有行为（zotero/reader selection.js、zotero/pdf.js normalizeChar、structure.js）：
 - 复制时每个换行插一个空格。对策：非段末行尾加隐形 U+2010，Zotero 当断行连字符连空格一起丢掉。其它阅读器复制会多出"‐"，所以单独出一版。
+- 它丢掉 U+0020 字形、按字距推断空格，英文词间留空隙，高亮会断开。对策：Zotero 版把空格写成 U+00A0（NFKD 后复制仍是普通空格）。
 - 所有字符做 NFKD：，；：？！（）全变半角。PDF 里无解，需要正确标点另给纯文本/Word。
 - 严格按内容流选择，跨页会带上前页正文之后的内容，所以 Zotero 版只写正文、脚注、图表（`--kinds body,note,figs` 可改）。脚注仍在两页正文之间；要彻底排除用 `--kinds body`（脚注不可搜索），先问用户。
 

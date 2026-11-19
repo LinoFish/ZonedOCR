@@ -756,6 +756,9 @@ def cmd_build():
                 yc = (l['box'][1] + l['box'][3]) / 2 * sy
                 base = yc + (cjk.ascender + cjk.descender) / 2 * fs
                 text, cp = l['text'], positions(pg, l)
+                # Zotero 丢掉 U+0020 字形，只按字距推断空格，留下的空隙会让高亮/选择在英文词间断开；
+                # 改写成 U+00A0（Zotero NFKD 后仍是普通空格，字框连续，复制只出一个空格）
+                if zot: text = text.replace(' ', '\u00a0')
                 colR = l.get('colR') or RIGHT; colW = l['bx'][1] - l['bx'][0]
                 if zot and kind in ('body', 'note') and cp and l['box'][2] > min(colR, localR) - 1.2 * KIND_H[kind] and l['box'][2] - l['box'][0] > .6 * colW:
                     text += '\u2010'; cp = cp + [(cp[-1][1], cp[-1][1] + 2)]
