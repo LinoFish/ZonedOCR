@@ -10,6 +10,7 @@
   python3 zonedocr.py WORK classify   # 分区 -> lines.json，打印每页统计、疑似漏行、低置信行
   python3 zonedocr.py WORK gaps       # 对疑似漏行空隙裁图重识别，打印 ADD 候选
   python3 zonedocr.py WORK toc        # 预览自动识别的章节书签和页标签
+  python3 zonedocr.py WORK autofix    # 自动校对：形近字、全书一致性、繁体书混入的简体字、脚注上标 -> autofix.json/.txt
   python3 zonedocr.py WORK proof      # 写 proof/pNNN.txt 供逐页对图校对
   python3 zonedocr.py WORK build [--zotero] [--debug] [--kinds body,note] [--out X.pdf]
   python3 zonedocr.py WORK check [PDF] # 抽文字检查空格/标点/常见误识/校对规则命中
@@ -51,7 +52,7 @@ def cmd_run():
     json.dump(cfg, open(cf, 'w'), ensure_ascii=False, indent=1)
     print(f'作业目录 {work}；Zotero 版：{"是" if zot else "否"}；目录大纲：{"是" if toc else "否"}；方向纠正：{"是" if desk else "否"}', flush=True)
     me = os.path.abspath(__file__)
-    for step in (['images'], ['ocr'], ['classify'], ['proof'], ['build'], ['check']):
+    for step in (['images'], ['ocr'], ['classify'], ['autofix'], ['proof'], ['build'], ['check']):
         print(f'== {step[0]}', flush=True); subprocess.run([sys.executable, me, work] + step, check=True)
     print(f'完成：{os.path.join(work, cfg["out"])}\n要提高准确度：对照 {work}/proof/ 写 corrections.py，再运行 build。')
 
@@ -88,6 +89,7 @@ CFG = {
     "render_dpi": 300,
     "det_thresh": None,        # 文字检测阈值（RapidOCR 默认 0.3）；翻拍、照片的书页整行漏识别时设 0.1
     "det_box_thresh": None,    # 检测框阈值（默认 0.5）；同上时设 0.2
+    "autofix": True,           # 自动校对（autofix 步骤的改动在 build 时套用）；false 关闭
     "line_tilt": True,         # 自动跟随文字倾斜：每行文字层按该行自身的斜度写（书页弯曲、照片透视时各行斜度不同），≥0.3° 才斜放；不开 deskew 也生效
 }
 CFG.update(json.load(open(os.path.join(WORK, 'config.json'))))
@@ -700,6 +702,7 @@ def final_pages():
     global EN
     EN = lang() == 'en'
     P = json.load(open(J('lines.json'))); R, ADD, HEADER = load_corr(); pages = {}
+    AF = load_autofix()
     Wd = json.load(open(J('words.json'))) if os.path.exists(J('words.json')) else {}
     for pg_s, p in P.items():
         pg = int(pg_s); lines = [dict(l) for l in p['lines']]
@@ -714,7 +717,11 @@ def final_pages():
                 l['box'] = [min(box[0], l['box'][0]), l['box'][1], max(box[2], l['box'][2]), l['box'][3]]
             else:
                 lines.append({'kind': kind, 'box': box, 'ocr': text, 'conf': 1})
+        af = AF.get(pg_s, {})
         for l in lines:
+            if l['kind'] in ('body', 'note', 'caption') and l['ocr'] in af:   # 自动校对先于 corrections.py；人工页规则命中原文的行以人工为准，不套自动改动
+                o = apply_rules(R.get(0, []), l['ocr'])
+                if not any((re.search(a[3:], o) if a.startswith('re:') else a in o) for a, _ in R.get(pg, [])): l['ocr'] = af[l['ocr']]
             t = l['ocr']; l['sl'] = box_slope(Wd.get(pg_s, []), l['box'])
             for kpg, frag, k in KIND_FIX:
                 if kpg == pg and frag in t: l['kind'] = k
@@ -757,6 +764,92 @@ def final_pages():
                 if l['kind'] == 'folio' and n >= 1:
                     l['text'] = str(n) if st == 'D' else to_roman(n)
     return pages
+
+
+# ---------------------------------------------------------------- autofix：自动校对可能识别错误的字
+# 不靠人工也能改掉的一类错：①形近字规则（带上下文，避免误伤）；②全书一致性——同一个词在书里出现多次，
+# 某处只差一个形近字、且这个写法全书只出现一次 → 按多数改；③繁体书里混进的简体字（v6 常见）→ 转回繁体；
+# ④中文句末标点后的 1–2 位数 → 脚注上标。改动写进 autofix.json（build/proof 自动套用，先于 corrections.py），
+# 清单和改不了的可疑行写进 autofix.txt 供对图复核。config autofix:false 关闭。
+CONFUSE = ['入人', '己已巳', '末未', '士土', '千干', '日曰', '戊戌戍', '拔拨', '候侯', '崇祟', '汩汨', '栗粟', '即既',
+           '大太犬', '王玉主', '撤撒', '辨辩辯', '幕慕暮', '侍待', '徽微', '析折', '贝见', '狠狼', '免兔', '鸟乌', '鳥烏']
+SIM = {c: g for g in CONFUSE for c in g}
+NOT_SUP = '個个章節节頁页卷年月日世紀纪次種种位項项條条點点名人天週周歲岁冊册部篇冊行段册版倍成號号'
+INTO = '进進闯闖导導纳納输輸介侵深潜潛渗滲植融嵌编編卷捲'
+AMBIG = set('采后里干发面系只台云余松准冲制征志周历范谷尽丑党借才折于御吁致姜困克划向咸占凶卜几了布并朴仆斗钟表复须游')
+
+def autofix_rules(trad):
+    zh_dash = '——'
+    return [
+        (rf'(?<={CJK})(?<!一)(一一|—一|一—)(?!一|[个個位種种次些])(?={CJK}|$)', zh_dash, '破折号'),
+        (r'暖昧', '曖昧' if trad else '暧昧', '形近字'),
+        (r'(?<![各獨独親亲])自已(?![經经])', '自己', '形近字'),
+        (r'己(?=[经經])', '已', '形近字'),
+        (r'(?<=而)己(?=[。，；！？」』）”]|$)', '已', '形近字'),
+        (rf'(?<=[{INTO}])人(?![们們员員士性民口物格类類家生心身])', '入', '入/人'),
+        (r'([，。；：、])\1', r'\1', '重复标点'),
+        (r'(?<=\d)[Oo](?=\d)', '0', '字母当数字'),
+        (r'(?<=\d)[lI](?=\d)', '1', '字母当数字'),
+        (rf'(?<=[。，；：！？」』）”])(\d{{1,2}})(?=[\u3400-\u9fff「（](?<![{NOT_SUP}]))', lambda m: m[1].translate(SUP), '脚注上标'),
+    ]
+
+def cmd_autofix():
+    P = json.load(open(J('lines.json'))); en = lang() == 'en'
+    rep, sus, fix = [], [], {}
+    texts = {(pg, i): l['ocr'] for pg, p in P.items() for i, l in enumerate(p['lines']) if l['kind'] in ('body', 'note', 'caption')}
+    if en:
+        json.dump({}, open(J('autofix.json'), 'w')); open(J('autofix.txt'), 'w').write('英文书：不做自动改字\n'); print('英文书，跳过'); return
+    try:
+        import opencc; s2t, t2s = opencc.OpenCC('s2tw'), opencc.OpenCC('t2s')   # s2tw：不把 吃/群/峰/欲 改成 喫/羣/峯/慾 这类异体
+    except Exception: s2t = t2s = None
+    allt = ''.join(texts.values())
+    if s2t:
+        nt = sum(a != b for a, b in zip(allt, t2s.convert(allt))); ns = sum(a != b for a, b in zip(allt, s2t.convert(allt)))
+        trad = nt > 3 * ns
+    else: trad = len(re.findall('[們這來說會為與國學個於對時從]', allt)) > len(re.findall('[们这来说会为与国学个于对时从]', allt))
+    rules = autofix_rules(trad)
+    if s2t:
+        s2t_full = opencc.OpenCC('s2t'); memo = {}
+        def simp_only(c):   # 只算纯简体字（务/号/机/内…）；裏/着/祕/群 这类繁体异体不动
+            if c not in memo: memo[c] = bool(re.match(r'[\u3400-\u9fff]', c)) and s2t_full.convert(c) != c and s2t.convert(c) != c and t2s.convert(c) == c
+            return memo[c]
+    # 全书词频：三字窗口
+    cnt = Counter(t[i:i + n] for t in texts.values() for n in (3,) for i in range(len(t) - n + 1))
+    def note(pg, kind, a, b, why): rep.append(f'p{pg} [{why}] {a} → {b}')
+    for (pg, i), t in texts.items():
+        l = P[pg]['lines'][i]; new = t; garbled = False; n0 = len(rep)
+        for pat, r, why in rules:
+            n2 = re.sub(pat, r, new)
+            if n2 != new: note(pg, l['kind'], new, n2, why); new = n2
+        if trad and s2t:   # 繁体书里的简体字
+            simp = [k for k, c in enumerate(new) if simp_only(c)]; conv = ''.join(s2t.convert(c) for c in new)
+            if len(new) >= 4 and len(simp) >= 3 and len(simp) > .3 * len(re.findall(r'[\u3400-\u9fff]', new)):
+                sus.append(f'p{pg} [疑似乱码，对图重打] {new}'); garbled = True
+            elif simp:
+                n2 = ''.join(conv[k] if k in simp and new[k] not in AMBIG else c for k, c in enumerate(new))
+                if n2 != new: note(pg, l['kind'], new, n2, '繁体书中的简体字'); new = n2
+        # 全书一致性：三字窗口里的形近字
+        chars = list(new)
+        for k, c in enumerate(new):
+            if c not in SIM or k == 0 or k == len(new) - 1: continue
+            w = new[k - 1:k + 2]
+            if cnt[w] > 1: continue
+            best = max(((cnt[w[0] + a + w[2]], a) for a in SIM[c] if a != c), default=(0, c))
+            if best[0] >= 3: chars[k] = best[1]
+        n2 = ''.join(chars)
+        if n2 != new: note(pg, l['kind'], new, n2, '全书一致性'); new = n2
+        if garbled or l.get('conf', 1) < .7: new = t; del rep[n0:]   # 乱码、很低置信的行整行留给人工对图重打
+        if new != t: fix.setdefault(pg, {})[t] = new
+        if l.get('conf', 1) < .9: sus.append(f'p{pg} [低置信 {l["conf"]:.2f}] {new}')
+    json.dump(fix, open(J('autofix.json'), 'w'), ensure_ascii=False, indent=0)
+    with open(J('autofix.txt'), 'w') as f:
+        f.write(f'自动改动 {len(rep)} 处（已套用；不对的在 corrections.py 里改回，或 config autofix:false）\n' + '\n'.join(rep))
+        f.write(f'\n\n需对图复核 {len(sus)} 行\n' + '\n'.join(sus) + '\n')
+    print('自动改动', len(rep), '需复核', len(sus), '→', J('autofix.txt'))
+
+def load_autofix():
+    if not CFG.get('autofix', True) or not os.path.exists(J('autofix.json')): return {}
+    return json.load(open(J('autofix.json')))
 
 WRITE_ORDER = ['body', 'note', 'figs', 'header', 'margin', 'folio']   # 写入顺序=选择顺序；figs=每个图表连同图注一组
 KINDS = {'figs': ('caption', 'table', 'figure')}
@@ -1114,4 +1207,4 @@ def cmd_overlay():
         p.get_pixmap(dpi=90).save(J(f'overlay/p{pn:03d}.png')); print(J(f'overlay/p{pn:03d}.png'))
 
 {'deskew': cmd_deskew, 'toc': cmd_toc, 'gaps': cmd_gaps, 'images': cmd_images, 'ocr': cmd_ocr, 'classify': cmd_classify, 'proof': cmd_proof,
- 'build': cmd_build, 'check': cmd_check, 'overlay': cmd_overlay}[CMD]()
+ 'build': cmd_build, 'check': cmd_check, 'autofix': cmd_autofix, 'overlay': cmd_overlay}[CMD]()

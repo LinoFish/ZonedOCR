@@ -14,6 +14,7 @@
 - **自动跟随文字倾斜**：歪斜的扫描、翻拍页保留原图，文字层按同一角度斜贴，每行再按自己的斜度写（书页弯曲、拍照透视时各行斜得不一样也能贴上），复制、高亮都顺着斜行走，不会框到上下行。默认开启，不开方向纠正也生效；想要扶正后的图和水平文字层，加 `--straighten`
 - **复杂版式**：横向双页扫描自动拆页；多栏页按栏连续复制；图表、图注单独成组
 - **逐字对齐**：高亮框贴合原图文字，浏览器、Zotero 里高亮连续不碎
+- **自动校对**：OCR 后自动改掉可判定的误识——形近字（入/人、己/已、暧/暖）、全书一致性（同一个词别处都对、只有一处差一个形近字就按多数改）、繁体书里混进的简体字、破折号、中文句末的脚注号转上标；乱码行、低置信行列进 `autofix.txt` 供对图复核。人工校对规则命中的行以人工为准。在三本已人工校对的书上实测：自动改 76 处，没有一处改错
 - **人工校对**：OCR 后按页对图校对（`corrections.py`），标点按中英文语境设全角/半角
 - **英文书**：自动识别英文书，脚注号转上标、"Chapter 9 + 章名"合成一个书签、Zotero 版英文行尾不粘词
 - **Zotero 专用版**：解决 Zotero 复制时换行插空格、英文词间高亮断开等问题
@@ -21,7 +22,7 @@
 ## 安装
 
 ```bash
-pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow
+pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow opencc-python-reimplemented
 # 另需 poppler-utils（pdftotext）
 ```
 

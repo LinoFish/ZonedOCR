@@ -14,6 +14,7 @@ Ordinary OCR only makes a scanned book searchable. ZonedOCR understands the page
 - **Text layer follows the tilt**: skewed scans and phone photos keep their original image, and the hidden text is laid at the same angle, line by line (each line uses its own slope, so curved pages and perspective work too). Copy and highlight follow the slanted lines instead of grabbing the lines above or below. On by default, even without orientation correction; add `--straighten` for straightened images with a level text layer
 - **Complex layouts**: two-page landscape scans are split; multi-column pages copy column by column; figures and captions are grouped
 - **Character-level alignment**: highlights sit on the scanned glyphs and stay continuous in browsers and Zotero
+- **Automatic proofreading**: after OCR, fixes errors it can decide on its own: look-alike characters (入/人, 己/已, 暧/暖), book-wide consistency (a word that appears correctly elsewhere but once with one look-alike character is changed to the majority form), simplified characters that slip into a traditional-Chinese book, dashes, and footnote numbers after Chinese sentence punctuation (turned into superscripts). Garbled and low-confidence lines go to `autofix.txt` for checking against the image. Lines your own correction rules touch keep your version. Tested on three hand-proofread books: 76 automatic changes, none wrong
 - **Proofreading pass**: page-by-page corrections against the image (`corrections.py`); punctuation set to full- or half-width by Chinese/English context
 - **English books**: detected automatically; footnote markers become superscripts, "Chapter 9" plus its title becomes one bookmark, and the Zotero edition never glues words across line ends
 - **Zotero edition**: fixes Zotero's extra spaces at line breaks and broken highlights between English words
@@ -21,7 +22,7 @@ Ordinary OCR only makes a scanned book searchable. ZonedOCR understands the page
 ## Install
 
 ```bash
-pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow
+pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow opencc-python-reimplemented
 # plus poppler-utils (pdftotext)
 ```
 
