@@ -17,7 +17,7 @@
 
 依赖: pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow ; poppler-utils
 """
-import sys, os, re, json, glob, statistics, difflib, importlib.util, subprocess, tempfile
+import sys, os, re, json, glob, statistics, difflib, importlib.util, subprocess, tempfile, math
 from collections import Counter
 
 def ask(q, default):
@@ -58,7 +58,8 @@ CFG = {
     "out": "out.pdf",          # 输出（相对 WORK）
     "page_offset": None,       # 印刷页码 = PDF页序 + page_offset；None = 由各页页码自动推算（页标签、补缺页码）
     "toc": True,               # 自动识别章节标题写入PDF书签
-    "deskew": False,           # images 后自动识别页面方向（90/180/270）并纠正小角度倾斜，输出用扶正后的页面图
+    "deskew": False,           # images 后自动识别页面方向（90/180/270）并纠正小角度倾斜（OCR 用扶正后的图）
+    "keep_skew": True,         # 方向纠正时保留原图的小角度倾斜，文字层按同一角度斜放（高亮/选择与歪斜的字重合）；False = 输出换成扶正后的图
     "zotero": False,           # build 默认出 Zotero 优化版（run 开头询问后写入）
     "lang": None,              # 'zh' / 'en'；None = 按 OCR 结果里中文字比例自动判断
     "toc_patterns": [          # (正则, 层级)；另外：明显大于正文字号的行视为1级标题
@@ -79,7 +80,10 @@ CFG = {
     "note_rule": True,         # 用脚注分隔短横线判定脚注区
     "auto_folio": True,         # 漏识别页码时按其它页页码的中位位置补一个；原书本无页码的页（如分部扉页）可关掉
     "rule_override": {},       # {"页序": y像素} 未检出分隔线时手工给
-    "render_dpi": 300,         # 页面不是单张嵌入图时的渲染分辨率
+    "render_dpi": 300,
+    "det_thresh": None,        # 文字检测阈值（RapidOCR 默认 0.3）；翻拍、照片的书页整行漏识别时设 0.1
+    "det_box_thresh": None,    # 检测框阈值（默认 0.5）；同上时设 0.2
+    "line_tilt": True,         # 每行文字层按该行自身的斜度写（书页弯曲、照片透视时各行斜度不同），≥0.3° 才斜放         # 页面不是单张嵌入图时的渲染分辨率
 }
 CFG.update(json.load(open(os.path.join(WORK, 'config.json'))))
 if CFG['src'] and not os.path.isabs(CFG['src']) and os.path.exists(os.path.join(WORK, CFG['src'])):
@@ -101,7 +105,10 @@ def load_corr():
         return {}, [], []
     spec = importlib.util.spec_from_file_location('corr', p); m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
+    global KIND_FIX
+    KIND_FIX = getattr(m, 'KIND', [])   # [(页序, OCR原文片段, 新类别)]：分错区的行改类别（如页顶的短正文行被当成书眉）
     return getattr(m, 'R', {}), getattr(m, 'ADD', []), getattr(m, 'HEADER', [])
+KIND_FIX = []
 
 def bbox(b):
     xs = [p[0] for p in b]; ys = [p[1] for p in b]; return [min(xs), min(ys), max(xs), max(ys)]
@@ -128,12 +135,20 @@ def cmd_images():
     print('pages', len(doc))
     if CFG.get('deskew'): cmd_deskew()
 
+def text_ink(g):
+    """文字墨迹（布尔图）：深色像素，且周围整体是亮的（排除照片里的桌面、书脊阴影、页边黑框等大块深色）"""
+    import numpy as np
+    from PIL import ImageFilter
+    a = np.array(g).astype(float); r = max(3, round(max(g.size) / 100))
+    local = np.array(g.filter(ImageFilter.BoxBlur(r * 3))).astype(float)
+    return (a < np.minimum(local - 40, 170)) & (local > 150)
+
 def skew_angle(im):
     """小角度倾斜：二值化后在 ±5° 内找使行投影最"尖"（相邻行差的方差最大）的角度"""
     import numpy as np
     from PIL import Image
     g = im.convert('L'); r = 1600 / max(g.size); g = g.resize((int(g.width * r), int(g.height * r)))
-    a = np.array(g); b = Image.fromarray(((a < min(160, a.mean() - 30)) * 255).astype('uint8'))
+    b = Image.fromarray((text_ink(g) * 255).astype('uint8'))
     def score(t):
         rows = np.array(b.rotate(t, resample=Image.BILINEAR)).sum(1).astype(float); return np.var(np.diff(rows))
     best = max(np.arange(-5, 5.01, .25), key=score)
@@ -157,6 +172,19 @@ def orientation(im, eng):
     best = max(sc, key=sc.get)
     return best if sc[best] > 1.3 * sc[0] + 5 else 0
 
+def pixel_gutter(im):
+    """横向双页的中缝（像素法，OCR 之前用）：中间 35%–65% 里深色文字像素最少的竖条"""
+    import numpy as np
+    gi = im.convert('L'); r = 1200 / max(gi.size); gi = gi.resize((int(gi.width * r), int(gi.height * r)))
+    ink = text_ink(gi).sum(0).astype(float); W = len(ink)
+    lo, hi = int(W * .35), int(W * .65); k = max(5, W // 100)
+    sm = np.convolve(ink[lo:hi], np.ones(k) / k, 'same') + np.abs(np.arange(hi - lo) + lo - W / 2) * ink.mean() * .002
+    return round((lo + int(sm.argmin())) / r)
+
+def straighten(im, ang):
+    from PIL import Image
+    return im.rotate(ang, resample=Image.BICUBIC, fillcolor=255 if im.mode == 'L' else (255,) * len(im.getbands())) if ang else im
+
 def cmd_deskew():
     """扶正页面图：方向 + 小角度倾斜；覆盖 images/，记到 orient.json，build 用扶正后的图替换 PDF 页面"""
     from PIL import Image
@@ -165,10 +193,23 @@ def cmd_deskew():
     for i, p in enumerate(images(), 1):
         im = Image.open(p); rot = orientation(im, eng)
         if rot: im = im.rotate(rot, expand=True)
-        ang = skew_angle(im)
-        if abs(ang) < .15: ang = 0
-        if ang: im = im.rotate(ang, resample=Image.BICUBIC, fillcolor=255 if im.mode == 'L' else (255,) * len(im.getbands()))
-        if rot or ang: im.save(p); log[i] = [rot, round(ang, 2)]; print(i, '旋转', rot, '倾斜', round(ang, 2), flush=True)
+        # 横向双页：左右两页常常歪向不同方向（书脊弯曲、拍照），各算各的角度、各自扶正后拼回去
+        segs = [[0, im.width]]
+        if CFG.get('spread', 'auto') is not False and im.width > im.height * 1.15:
+            gx = pixel_gutter(im); segs = [[0, gx], [gx, im.width]]
+        angs = []
+        for x0, x1 in segs:
+            a = skew_angle(im.crop((x0, 0, x1, im.height))); angs.append(round(a, 2) if abs(a) >= .15 else 0)
+        if any(angs) and rot and CFG.get('keep_skew', True):   # 只转方向、不扶正的图，build 放进 PDF
+            os.makedirs(J('orient'), exist_ok=True); im.save(J(f'orient/p{i:03d}.png'))
+        if any(angs):
+            out = im.copy()
+            for (x0, x1), a in zip(segs, angs):
+                if a: out.paste(straighten(im.crop((x0, 0, x1, im.height)), a), (x0, 0))
+            im = out
+        if rot or any(angs):
+            im.save(p); log[i] = [rot, angs[0], segs] if len(segs) == 1 else [rot, angs, segs]
+            print(i, '旋转', rot, '倾斜', angs, flush=True)
     json.dump(log, open(J('orient.json'), 'w')); print('扶正的页', len(log))
 
 def images():
@@ -200,9 +241,11 @@ def make_engine(v=None):
     config rec:'v5' 用 PP-OCRv5 server；'v4' 用 RapidOCR 自带模型（繁体大量丢字、转简）。检测模型都用 RapidOCR 自带的。"""
     from rapidocr_onnxruntime import RapidOCR
     v = v or CFG.get('rec', 'v6')
-    if v not in ('v5', 'v6'): return RapidOCR()
+    # 检测阈值：翻拍/照片书页上不少行的检测概率偏低，默认阈值（0.3/0.5）会整行漏掉；config det_thresh/det_box_thresh 可调低（如 0.1/0.2）
+    kw = {k: CFG[k] for k in ('det_thresh', 'det_box_thresh') if CFG.get(k) is not None}
+    if v not in ('v5', 'v6'): return RapidOCR(**kw)
     m, d = fetch_model(v)
-    return RapidOCR(rec_model_path=m, rec_keys_path=d)
+    return RapidOCR(rec_model_path=m, rec_keys_path=d, **kw)
 
 def dash_gaps(row, img_w):
     """v6 识别时常把破折号整个丢掉，只在逐字框里留下一段空白。返回可疑空白处的字序号（-1=行首，n-1=行尾）"""
@@ -238,14 +281,41 @@ def patch_dashes(row, gaps, v5txt):
 def cmd_ocr():
     from PIL import Image
     import numpy as np
-    eng = make_engine(); v6 = CFG.get('rec', 'v6') == 'v6'; e5 = None; out = {}; fixed = 0
+    eng = make_engine(); v6 = CFG.get('rec', 'v6') == 'v6'; e5 = None; out = {}; fixed = 0; fixed_rows = [0]
     for i, p in enumerate(images(), 1):
-        res, _ = eng(p, return_word_box=True)
+        # 调用时带任何关键字参数，RapidOCR 都会把 box_thresh 重置成 0.5，所以这里显式传回去
+        res, _ = eng(p, return_word_box=True, box_thresh=CFG.get('det_box_thresh') or .5, text_score=.3)
         rows = []
         for r in res or []:
             boxes = r[3] if len(r) > 3 else []; chars = r[4] if len(r) > 4 else []
             rows.append({'box': [[float(a) for a in pt] for pt in r[0]], 'text': r[1], 'conf': float(r[2]),
                          'cboxes': [[min(q[0] for q in b), max(q[0] for q in b)] for b in boxes], 'chars': list(chars)})
+        # 低置信行：检测框常被相邻行或书页弯曲带歪，斜着裁出来识别成乱码（品务房…）。裁一块水平的图重新检测+识别，取置信更高的结果
+        bad = [r for r in rows if r['conf'] < .8 and len(r['text']) > 1]
+        if bad:
+            pim = Image.open(p).convert('RGB'); keep = [r for r in rows if r not in bad]
+            for r in bad:
+                b = bbox(r['box']); cy = (b[1] + b[3]) / 2; hh = min(b[3] - b[1], 1.2 * abs(r['box'][3][1] - r['box'][0][1]) + 1)
+                x0, y0 = max(0, b[0] - 15), max(0, int(cy - hh)); crop = pim.crop((x0, y0, b[2] + 15, int(cy + hh)))
+                res2, _ = eng(np.array(crop)[:, :, ::-1], return_word_box=True, box_thresh=CFG.get('det_box_thresh') or .5, text_score=.3)
+                new = []
+                for q in res2 or []:
+                    qb = bbox(q[0])
+                    if not (qb[1] < cy - y0 < qb[3]) or float(q[2]) < .8: continue
+                    new.append({'box': [[float(pt[0]) + x0, float(pt[1]) + y0] for pt in q[0]], 'text': q[1], 'conf': float(q[2]),
+                                'cboxes': [[min(c[0] for c in bb) + x0, max(c[0] for c in bb) + x0] for bb in (q[3] if len(q) > 3 else [])],
+                                'chars': list(q[4]) if len(q) > 4 else []})
+                def dup(n):   # 和已有的行重叠（同一行被识别两次）
+                    nb = bbox(n['box'])
+                    for k in keep:
+                        kb = bbox(k['box']); ov = max(0, min(nb[3], kb[3]) - max(nb[1], kb[1])) * max(0, min(nb[2], kb[2]) - max(nb[0], kb[0]))
+                        if ov > .3 * min((nb[2] - nb[0]) * (nb[3] - nb[1]), (kb[2] - kb[0]) * (kb[3] - kb[1])) and \
+                           difflib.SequenceMatcher(None, n['text'], k['text']).ratio() > .5: return True
+                    return False
+                new = [n for n in new if not dup(n)]
+                if new and sum(len(n['text']) for n in new) >= .5 * len(r['text']): keep += new; fixed_rows[0] += 1
+                elif r['conf'] >= .5: keep.append(r)
+            rows = sorted(keep, key=lambda r: (bbox(r['box'])[1], bbox(r['box'])[0]))
         if v6 and CFG.get('dash_fix', True):
             im = None
             for row in rows:
@@ -260,6 +330,7 @@ def cmd_ocr():
         out[i] = rows; print(i, len(rows), flush=True)
         json.dump(out, open(J('words.json'), 'w'), ensure_ascii=False)
     if v6: print('v5 补回破折号的行', fixed)
+    print('低置信行重识别', fixed_rows[0])
 
 # ---------------------------------------------------------------- classify
 def find_rule(im, H, W):
@@ -458,6 +529,17 @@ def layout_lines(p):
                     l['seg'] = sum(1 for y in fw if (y <= yc if l['ci'] == -1 else y < yc))
     return p
 
+def box_slope(rows, box):
+    """该行在（扶正后）图上的斜率 dy/dx：取重叠最多的检测框，用上下两条边的平均斜率"""
+    x0, y0, x1, y1 = box; best, sl = 0, 0.
+    for row in rows:
+        q = row['box']; ry0 = min(p[1] for p in q); ry1 = max(p[1] for p in q)
+        ov = max(0, min(y1, ry1) - max(y0, ry0)) * max(0, min(x1, max(p[0] for p in q)) - max(x0, min(p[0] for p in q)))
+        if ov > best and len(q) == 4:
+            d = [(q[1][1] - q[0][1]) / max(q[1][0] - q[0][0], 1), (q[2][1] - q[3][1]) / max(q[2][0] - q[3][0], 1)]
+            best, sl = ov, sum(d) / 2
+    return sl if abs(sl) > math.tan(math.radians(.3)) and abs(sl) < .2 else 0.
+
 def reading_order(ls):
     """阅读顺序：先按 (页, 段, 栏 / 图表) 分组，组内按行聚类（同一行的碎片按 x），行间自上而下"""
     def gkey(l):
@@ -466,9 +548,12 @@ def reading_order(ls):
     out = []; groups = {}
     for l in ls: groups.setdefault(gkey(l), []).append(l)
     for k in sorted(groups):
-        g = sorted(groups[k], key=lambda l: (l['box'][1] + l['box'][3]) / 2); rows = []
+        gx = min(l['box'][0] for l in groups[k])
+        def yat(l):   # 斜行：把行中心按斜率推到组左端再比较高低（缩进的首行外接框中心会比下一行还低）
+            return (l['box'][1] + l['box'][3]) / 2 + l.get('sl', 0) * (gx - (l['box'][0] + l['box'][2]) / 2)
+        g = sorted(groups[k], key=yat); rows = []
         for l in g:
-            yc = (l['box'][1] + l['box'][3]) / 2; h = l['box'][3] - l['box'][1]
+            yc = yat(l); h = max(8, l['box'][3] - l['box'][1] - abs(l.get('sl', 0)) * (l['box'][2] - l['box'][0]))
             if rows and abs(rows[-1][0] - yc) < .45 * min(h, rows[-1][1]): rows[-1][2].append(l)
             else: rows.append([yc, h, [l]])
         for r in rows: out += sorted(r[2], key=lambda l: l['box'][0])
@@ -511,7 +596,7 @@ def cmd_classify():
             for r in rrows:
                 for t, b in split_margin(im[:, rx0:rx1], r['text'], [v - (rx0 if i % 2 == 0 else 0) for i, v in enumerate(bbox(r['box']))], rw, CFG['margin_regex']):
                     b = [b[0] + rx0, b[1], b[2] + rx0, b[3]]
-                    if b[3] < H * CFG['header_band']: k = 'header'
+                    if b[3] < H * CFG['header_band'] and not (b[2] - b[0] > rw * .6 and re.search(r'[，。、；：]', t)): k = 'header'   # 页顶的长行是正文（照片/翻拍时正文可能顶到页边）
                     elif b[1] > H * CFG['folio_band'] and len(t) <= 4:
                         k = 'folio'
                         if CFG['page_offset'] is not None: t = str(pg + CFG['page_offset'])
@@ -610,6 +695,7 @@ def final_pages():
     global EN
     EN = lang() == 'en'
     P = json.load(open(J('lines.json'))); R, ADD, HEADER = load_corr(); pages = {}
+    Wd = json.load(open(J('words.json'))) if os.path.exists(J('words.json')) else {}
     for pg_s, p in P.items():
         pg = int(pg_s); lines = [dict(l) for l in p['lines']]
         for (apg, kind, box, text) in ADD:
@@ -624,7 +710,9 @@ def final_pages():
             else:
                 lines.append({'kind': kind, 'box': box, 'ocr': text, 'conf': 1})
         for l in lines:
-            t = l['ocr']
+            t = l['ocr']; l['sl'] = box_slope(Wd.get(pg_s, []), l['box'])
+            for kpg, frag, k in KIND_FIX:
+                if kpg == pg and frag in t: l['kind'] = k
             if l['kind'] == 'header':
                 for pat, rep in HEADER:
                     if re.search(pat, t): t = rep; break
@@ -811,13 +899,34 @@ def cmd_build():
                     cells.append((ch, cx0 + (cx1 - cx0) * k / n, cx0 + (cx1 - cx0) * (k + 1) / n))
         return sorted(cells, key=lambda c: c[1])
 
+    def line_slope(pg, box):
+        """该行在（扶正后）图上的斜率 dy/dx：取重叠最多的检测框，用上下两条边的平均斜率"""
+        x0, y0, x1, y1 = box; best, sl = 0, 0.
+        for row in Wd[str(pg)]:
+            q = row['box']; ry0 = min(p[1] for p in q); ry1 = max(p[1] for p in q)
+            ov = max(0, min(y1, ry1) - max(y0, ry0)) * max(0, min(x1, max(p[0] for p in q)) - max(x0, min(p[0] for p in q)))
+            if ov > best and len(q) == 4:
+                d = [(q[1][1] - q[0][1]) / max(q[1][0] - q[0][0], 1), (q[2][1] - q[3][1]) / max(q[2][0] - q[3][0], 1)]
+                best, sl = ov, sum(d) / 2
+        return sl if abs(sl) > math.tan(math.radians(.3)) and abs(sl) < .2 else 0.
+
+    def uniform(text, x0, x1):   # 没有可信的逐字框时按字形宽度比例分配（英文字母不会被拉成方块字那么宽）
+        if not text: return []
+        wt = [max(.25, (cjk if cjk.has_glyph(ord(ch)) else lat).glyph_advance(ord(ch))) for ch in text]
+        k = (x1 - x0) / sum(wt); out = []; x = x0
+        for w in wt: out.append((x, x + w * k)); x += w * k
+        return out
+
     def positions(pg, l):
         """校对后文本与OCR逐字框对齐（difflib），插入/替换的字均分相邻空间"""
         text = l['text']; x0, _, x1, _ = l['box']; cells = cells_for(pg, l['box']); n = len(text)
         if not cells or not n:
-            w = (x1 - x0) / max(n, 1); return [(x0 + i * w, x0 + (i + 1) * w) for i in range(n)]
+            return uniform(text, x0, x1)
         pos = [None] * n
-        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ''.join(c[0] for c in cells), text, autojunk=False).get_opcodes():
+        ops = difflib.SequenceMatcher(None, ''.join(c[0] for c in cells), text, autojunk=False).get_opcodes()
+        if sum(i2 - i1 for t, i1, i2, j1, j2 in ops if t == 'equal') < .5 * n:   # 逐字框属于别的行（斜行外接框互相重叠时）→ 均分
+            return uniform(text, x0, x1)
+        for tag, i1, i2, j1, j2 in ops:
             if tag == 'equal':
                 for k in range(i2 - i1): pos[j1 + k] = cells[i1 + k][1:]
             elif tag == 'replace':
@@ -834,9 +943,15 @@ def cmd_build():
             m = hi - lo
             for k in range(m): pos[lo + k] = (A + (B - A) * k / m, A + (B - A) * (k + 1) / m)
             i = j
+        pos = [(min(max(a, x0 - 5), x1 + 5), min(max(b, x0 - 5), x1 + 5)) for a, b in pos]
+        for i in range(1, n):   # 字框必须单调前进
+            if pos[i][0] < pos[i - 1][0]: pos[i] = (pos[i - 1][0], max(pos[i][1], pos[i - 1][0]))
         pos = [(a, max(b, a + 1)) for a, b in pos]
         for i in range(n - 1):  # 首尾相接，避免阅读器插空格
             pos[i] = (pos[i][0], max(pos[i + 1][0], pos[i][0] + 1))
+        ws = sorted(b - a for a, b in pos)
+        if n > 3 and (ws[-1] > max(5 * ws[n // 2], 2 * (x1 - x0) / n) or ws[n // 2] < .15 * (x1 - x0) / n):   # 个别字被拉得很宽（字框缺口）→ 均分
+            return uniform(text, x0, x1)
         return pos
 
     doc = pymupdf.open(CFG['src'])
@@ -846,17 +961,35 @@ def cmd_build():
             page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                                   text=pymupdf.PDF_REDACT_TEXT_REMOVE)
     orient = json.load(open(J('orient.json'))) if os.path.exists(J('orient.json')) else {}
-    for k in orient:   # 扶正过的页：换成扶正后的图（转了 90/270 的页宽高互换）
+    keep = CFG.get('keep_skew', True); tilt = {}
+    for k, v in orient.items():
+        rot, ang = v[0], v[1]; segs = v[2] if len(v) > 2 else None
+        angs = ang if isinstance(ang, list) else [ang]; ang = any(angs)
+        # keep_skew：不转方向的页保留原图，文字层斜放；转了方向的页换成"只转方向"的图（仍带原倾斜）。
+        # 否则换成扶正后的图。换图的页按图的宽高比重设页面（转了 90/270 的页宽高互换），图铺满整页。
+        if keep and ang: tilt[int(k)] = list(zip(segs or [[0, 1e9]], angs))
+        if keep and not rot: continue
         from PIL import Image
-        page = doc[int(k) - 1]; img = f'{IMG}/p{int(k):03d}.png'; im = Image.open(img)
-        w0, h0 = page.rect.width, page.rect.height
-        if (im.width > im.height) != (w0 > h0): w0, h0 = h0, w0
-        jp = img[:-4] + '.jpg'; im.convert('L' if im.mode in ('L', '1') else 'RGB').save(jp, quality=88)
+        page = doc[int(k) - 1]; img = J(f'orient/p{int(k):03d}.png') if keep and ang else f'{IMG}/p{int(k):03d}.png'
+        im = Image.open(img); L = max(page.rect.width, page.rect.height); r = L / max(im.size)
+        jp = J(f'_p{int(k):03d}.jpg'); im.convert('L' if im.mode in ('L', '1') else 'RGB').save(jp, quality=88)
         page.set_rotation(0)
         for x in page.get_contents(): doc.update_stream(x, b'')
-        page.set_mediabox(pymupdf.Rect(0, 0, w0, h0)); page.insert_image(page.rect, filename=jp); os.remove(jp)
+        page.set_mediabox(pymupdf.Rect(0, 0, im.width * r, im.height * r)); page.insert_image(page.rect, filename=jp); os.remove(jp)
+
+    def img_rect(page):
+        """扫描图在页面上的位置（PyMuPDF 坐标，y 向下）。单张不旋转的图且没铺满整页时按图的位置放文字，否则整页"""
+        try:
+            inf = page.get_image_info(xrefs=True)
+            if len(inf) == 1:
+                a, b, c, d, e, f = inf[0]['transform']
+                if a > 0 and d > 0 and abs(b) < 1e-6 and abs(c) < 1e-6:
+                    return pymupdf.Rect(inf[0]['bbox']) & page.rect
+        except Exception: pass
+        return page.rect
     for pg, p in pages.items():
-        page = doc[pg - 1]; sx = page.rect.width / p['w']; sy = page.rect.height / p['h']; PH = page.rect.height
+        page = doc[pg - 1]; ir = img_rect(page); PH = page.rect.height
+        sx = ir.width / p['w']; sy = ir.height / p['h']; OX, OY = ir.x0, ir.y0
         kinds = ['body', 'note', 'figs'] if zot else WRITE_ORDER
         if '--kinds' in ARGS: kinds = ARGS[ARGS.index('--kinds') + 1].split(',')
         # 每行一个 BT…ET；行内切成若干段，每段一个 Tj、一个 Tz（段宽=字框总宽）。段尽量长：只要段内每个字
@@ -872,9 +1005,14 @@ def cmd_build():
                 nb = [m for m in ls[max(idx - 1, 0):idx + 2] if grp(m) == grp(l)]
                 nxt = idx + 1 < len(ls) and grp(ls[idx + 1]) == grp(l)
                 localR = max(m['box'][2] for m in nb) if nxt else 9e9   # 引文等缩排段：和上下行右端对齐也算没断段
-                h = l['box'][3] - l['box'][1]; hh = h if h > 1.4 * KIND_H[l['kind']] else KIND_H[l['kind']]
+                sl = line_slope(pg, l['box']) if CFG.get('line_tilt', True) else 0.
+                h = l['box'][3] - l['box'][1] - abs(sl) * (l['box'][2] - l['box'][0])   # 斜行的外接框高度含倾斜部分，扣掉才是字高
+                hh = h if h > 1.4 * KIND_H[l['kind']] else KIND_H[l['kind']]
                 fs = hh * sy * .80
-                yc = (l['box'][1] + l['box'][3]) / 2 * sy
+                if hh > KIND_H[l['kind']]:   # 大字号只给真正的大字：按字数和行宽估一个上限（多行误并成一个高框时不会冒出巨字）
+                    em = sum((cjk if cjk.has_glyph(ord(ch)) else lat).glyph_advance(ord(ch)) for ch in l['text']) or 1
+                    fs = max(KIND_H[l['kind']] * sy * .8, min(fs, 1.25 * (l['box'][2] - l['box'][0]) * sx / em))
+                yc = (l['box'][1] + l['box'][3]) / 2 * sy + OY
                 base = yc + (cjk.ascender + cjk.descender) / 2 * fs
                 text, cp = l['text'], positions(pg, l)
                 # Zotero 丢掉 U+0020 字形，只按字距推断空格，留下的空隙会让高亮/选择在英文词间断开；
@@ -889,10 +1027,15 @@ def cmd_build():
                     f = cjk if cjk.has_glyph(ord(ch)) else lat   # Droid 缺的（⁴⁵⁶…）用 Noto 补
                     g = f.has_glyph(ord(ch)); adv = f.glyph_advance(ord(ch)) * fs
                     if not g or adv <= 0: continue
-                    seq.append((ch, g, cx0 * sx, max((cx1 - cx0) * sx, .3), adv, f is lat))
+                    seq.append((ch, g, cx0 * sx + OX, max((cx1 - cx0) * sx, .3), adv, f is lat))
                 if not seq: continue
                 for c in seq: (alt_text if c[5] else alltext).append(c[0])
-                o = [f'BT /FONT {fs:.3f} Tf 1 0 0 1 {seq[0][2]:.2f} {PH - base:.2f} Tm']; cur = None; i = 0
+                # 斜行：起点的 y 按该行斜率从行中点推到首字处，Tm 带旋转，字沿斜线前进；横向字宽按 cos 拉长成沿斜线的长度
+                xm = (l['box'][0] + l['box'][2]) / 2 * sx + OX; y0b = base + sl * (seq[0][2] - xm)
+                if sl:
+                    k = math.sqrt(1 + sl * sl); seq = [(c[0], c[1], c[2], c[3] * k, c[4], c[5]) for c in seq]
+                cs, sn = 1 / math.sqrt(1 + sl * sl), -sl / math.sqrt(1 + sl * sl)
+                o = [f'BT /FONT {fs:.3f} Tf {cs:.5f} {sn:.5f} {-sn:.5f} {cs:.5f} {seq[0][2]:.2f} {PH - y0b:.2f} Tm']; cur = None; i = 0
                 tol = .35 * statistics.median(c[3] for c in seq)
                 def fits(run):   # 统一缩放后各字起点与字框起点的最大偏差
                     th = sum(c[3] for c in run) / sum(c[4] for c in run); x = 0; w = 0
@@ -907,7 +1050,15 @@ def cmd_build():
                     if isl != cur: o.append(f'/{"FONT2" if isl else "FONT"} {fs:.3f} Tf'); cur = isl
                     th = sum(c[3] for c in run) / sum(c[4] for c in run)
                     o.append(f'{th * 100:.2f} Tz <{"".join(f"{c[1]:04x}" for c in run)}>Tj')
-                ops.append('\n'.join(o) + '\nET')
+                blk = '\n'.join(o) + '\nET'
+                if pg in tilt:   # 文字层绕（半）页图中心转回原图的倾斜角：OCR 坐标在扶正图上，原图=扶正图顺时针转 ang 度
+                    xc = (l['box'][0] + l['box'][2]) / 2
+                    (s0, s1), a = next((sg for sg in tilt[pg] if sg[0][0] <= xc < sg[0][1]), tilt[pg][-1])
+                    if a:
+                        s1 = min(s1, p['w']); t = math.radians(-a); c_, s_ = math.cos(t), math.sin(t)
+                        cx = OX + (s0 + s1) / 2 * sx; cy = PH - (OY + p['h'] / 2 * sy)
+                        blk = f'q {c_:.6f} {s_:.6f} {-s_:.6f} {c_:.6f} {cx - c_ * cx + s_ * cy:.3f} {cy - s_ * cx - c_ * cy:.3f} cm\n' + blk + '\nQ'
+                ops.append(blk)
         if not ops: continue
         old = set(page.get_contents())
         tw = pymupdf.TextWriter(page.rect); tw.append((0, 50), ''.join(alltext) or '　', font=cjk, fontsize=8)
@@ -917,6 +1068,7 @@ def cmd_build():
         names = re.findall(rb'/(F\d+) [\d.]+ Tf', doc.xref_stream(xs[0]))
         stream = '\n'.join(ops).replace('/FONT2', '/' + (names[-1].decode() if alt_text else 'F0')).replace('/FONT', '/' + names[0].decode())
         head = '1 0 0 1 0 0 cm\n' + ('0 Tr 1 0 0 rg\n' if dbg else '3 Tr\n')
+
         doc.update_stream(xs[0], ('q\n' + head + stream + '\nQ\n').encode())
     lab, ranges = page_labels(pages)   # 页标签=印刷页码，Zotero/阅读器引用时用
     if ranges: doc.set_page_labels(ranges); print('page labels', ranges)
