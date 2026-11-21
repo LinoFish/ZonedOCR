@@ -2,7 +2,7 @@
 """ZonedOCR（分区 OCR）— 扫描版中文/英文书页 → 分区隐形文字层 PDF（可复制/搜索/高亮）
 
 一条命令跑完（开头问三个问题：要不要 Zotero 优化版、目录大纲、方向纠正，之后不再打扰）:
-  python3 zonedocr.py run book.pdf [WORK] [--zotero|--no-zotero] [--toc|--no-toc] [--deskew|--no-deskew]
+  python3 zonedocr.py run book.pdf [WORK] [--zotero|--no-zotero] [--toc|--no-toc] [--deskew|--no-deskew] [--straighten] [--no-line-tilt]
 
 分步（在作业目录 WORK 下放 config.json，可选 corrections.py）:
   python3 zonedocr.py WORK images     # 抽出/渲染页面图
@@ -43,6 +43,11 @@ def cmd_run():
     os.makedirs(work, exist_ok=True); cf = os.path.join(work, 'config.json')
     cfg = json.load(open(cf)) if os.path.exists(cf) else {}
     cfg.update({'src': src, 'out': base + ('_OCR_Zotero.pdf' if zot else '_OCR.pdf'), 'zotero': zot, 'toc': toc, 'deskew': desk})
+    # 文字层自动跟随倾斜（默认开）：--straighten 改为输出扶正后的图、文字层水平；--no-line-tilt 关掉逐行斜度
+    if '--straighten' in fl: cfg['keep_skew'] = False
+    if '--keep-skew' in fl: cfg['keep_skew'] = True
+    if '--no-line-tilt' in fl: cfg['line_tilt'] = False
+    if '--line-tilt' in fl: cfg['line_tilt'] = True
     json.dump(cfg, open(cf, 'w'), ensure_ascii=False, indent=1)
     print(f'作业目录 {work}；Zotero 版：{"是" if zot else "否"}；目录大纲：{"是" if toc else "否"}；方向纠正：{"是" if desk else "否"}', flush=True)
     me = os.path.abspath(__file__)
@@ -83,7 +88,7 @@ CFG = {
     "render_dpi": 300,
     "det_thresh": None,        # 文字检测阈值（RapidOCR 默认 0.3）；翻拍、照片的书页整行漏识别时设 0.1
     "det_box_thresh": None,    # 检测框阈值（默认 0.5）；同上时设 0.2
-    "line_tilt": True,         # 每行文字层按该行自身的斜度写（书页弯曲、照片透视时各行斜度不同），≥0.3° 才斜放         # 页面不是单张嵌入图时的渲染分辨率
+    "line_tilt": True,         # 自动跟随文字倾斜：每行文字层按该行自身的斜度写（书页弯曲、照片透视时各行斜度不同），≥0.3° 才斜放；不开 deskew 也生效
 }
 CFG.update(json.load(open(os.path.join(WORK, 'config.json'))))
 if CFG['src'] and not os.path.isabs(CFG['src']) and os.path.exists(os.path.join(WORK, CFG['src'])):

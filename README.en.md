@@ -10,7 +10,8 @@ Ordinary OCR only makes a scanned book searchable. ZonedOCR understands the page
 - **Smart zoning**: body text, footnotes, figures, running headers, margin numbers and folios are written as separate zones, so selecting body text never drags in headers, page numbers or notes
 - **Printed page numbers**: detects the book's own page numbers and writes them as PDF page labels (Roman-numeral front matter included), so Zotero and other readers cite the original pages; misread folios are corrected from neighbouring pages
 - **Automatic bookmarks**: chapter and section headings become an outline
-- **Orientation & deskew**: upside-down or sideways pages (90°/180°/270°) are detected and small skews straightened; the output PDF uses the corrected page images. Adds about 20 s per page on a 2-core CPU; the prompt shows the estimated extra time for your book
+- **Orientation**: upside-down or sideways pages (90°/180°/270°) are detected and turned upright. Adds about 20 s per page on a 2-core CPU; the prompt shows the estimated extra time for your book
+- **Text layer follows the tilt**: skewed scans and phone photos keep their original image, and the hidden text is laid at the same angle, line by line (each line uses its own slope, so curved pages and perspective work too). Copy and highlight follow the slanted lines instead of grabbing the lines above or below. On by default, even without orientation correction; add `--straighten` for straightened images with a level text layer
 - **Complex layouts**: two-page landscape scans are split; multi-column pages copy column by column; figures and captions are grouped
 - **Character-level alignment**: highlights sit on the scanned glyphs and stay continuous in browsers and Zotero
 - **Proofreading pass**: page-by-page corrections against the image (`corrections.py`); punctuation set to full- or half-width by Chinese/English context
@@ -38,7 +39,7 @@ python3 zonedocr.py run book.pdf
 # … 完成：book_work/book_OCR_Zotero.pdf
 ```
 
-Skip the questions with flags: `--zotero` / `--no-zotero`, `--toc` / `--no-toc`, `--deskew` / `--no-deskew`.
+Skip the questions with flags: `--zotero` / `--no-zotero`, `--toc` / `--no-toc`, `--deskew` / `--no-deskew`. Tilt: `--straighten` (straightened image, level text) and `--no-line-tilt` (no per-line slope); in config.json these are `keep_skew` and `line_tilt`.
 
 For higher accuracy, proofread against the per-page text in `book_work/proof/`, write `corrections.py`, then run `python3 zonedocr.py book_work build`. The individual steps (images / ocr / classify / proof / build / check) are described in SKILL.md.
 
