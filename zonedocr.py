@@ -16,7 +16,7 @@
   python3 zonedocr.py WORK check [PDF] # 抽文字检查空格/标点/常见误识/校对规则命中
   python3 zonedocr.py WORK overlay 2,13 [PDF]  # 渲染字符高亮框叠加图到 WORK/overlay/
 
-依赖: pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow ; poppler-utils
+依赖: pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow opencc-python-reimplemented ; poppler-utils
 """
 import sys, os, re, json, glob, statistics, difflib, importlib.util, subprocess, tempfile, math
 from collections import Counter
@@ -801,7 +801,9 @@ def cmd_autofix():
         json.dump({}, open(J('autofix.json'), 'w')); open(J('autofix.txt'), 'w').write('英文书：不做自动改字\n'); print('英文书，跳过'); return
     try:
         import opencc; s2t, t2s = opencc.OpenCC('s2tw'), opencc.OpenCC('t2s')   # s2tw：不把 吃/群/峰/欲 改成 喫/羣/峯/慾 这类异体
-    except Exception: s2t = t2s = None
+    except Exception:
+        s2t = t2s = None
+        print('提示：未装 opencc（pip install opencc-python-reimplemented），繁体书里混入的简体字不会自动改，繁简判断也较粗')
     allt = ''.join(texts.values())
     if s2t:
         nt = sum(a != b for a, b in zip(allt, t2s.convert(allt))); ns = sum(a != b for a, b in zip(allt, s2t.convert(allt)))
