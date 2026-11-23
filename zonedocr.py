@@ -6,7 +6,7 @@
 
 分步（在作业目录 WORK 下放 config.json，可选 corrections.py）:
   python3 zonedocr.py WORK images     # 抽出/渲染页面图
-  python3 zonedocr.py WORK ocr        # RapidOCR 行+逐字框 -> words.json（最慢，约1页/秒）
+  python3 zonedocr.py WORK ocr [a-b] [--redo]  # RapidOCR 行+逐字框 -> words.json（最慢，约16秒/页；可续跑，已做的页跳过）
   python3 zonedocr.py WORK classify   # 分区 -> lines.json，打印每页统计、疑似漏行、低置信行
   python3 zonedocr.py WORK gaps       # 对疑似漏行空隙裁图重识别，打印 ADD 候选
   python3 zonedocr.py WORK toc        # 预览自动识别的章节书签和页标签
@@ -289,7 +289,12 @@ def cmd_ocr():
     from PIL import Image
     import numpy as np
     eng = make_engine(); v6 = CFG.get('rec', 'v6') == 'v6'; e5 = None; out = {}; fixed = 0; fixed_rows = [0]
+    # 可续跑：已有 words.json 时跳过做完的页（长书分几次跑、中断后接着跑）；--redo 全部重做；ARGS 里 "a-b" 只做这几页
+    if '--redo' not in ARGS and os.path.exists(J('words.json')): out = json.load(open(J('words.json')))
+    rng = next((tuple(map(int, a.split('-'))) for a in ARGS if re.fullmatch(r'\d+-\d+', a)), None)
+    if out: print('续跑：已有', len(out), '页', flush=True)
     for i, p in enumerate(images(), 1):
+        if str(i) in out or (rng and not rng[0] <= i <= rng[1]): continue
         # 调用时带任何关键字参数，RapidOCR 都会把 box_thresh 重置成 0.5，所以这里显式传回去
         res, _ = eng(p, return_word_box=True, box_thresh=CFG.get('det_box_thresh') or .5, text_score=.3)
         rows = []
@@ -334,8 +339,8 @@ def cmd_ocr():
                 crop = np.array(im.crop((max(0, b[0] - h * .3), b[1], b[2] + h * .3, b[3])))[:, :, ::-1]
                 r5, _ = e5(crop, use_det=False, use_cls=False)
                 if r5: fixed += patch_dashes(row, g, r5[0][0])
-        out[i] = rows; print(i, len(rows), flush=True)
-        json.dump(out, open(J('words.json'), 'w'), ensure_ascii=False)
+        out[str(i)] = rows; print(i, len(rows), flush=True)
+        json.dump(out, open(J('words.json.tmp'), 'w'), ensure_ascii=False); os.replace(J('words.json.tmp'), J('words.json'))   # 原子写：中途被杀也不会损坏
     if v6: print('v5 补回破折号的行', fixed)
     print('低置信行重识别', fixed_rows[0])
 
@@ -431,6 +436,8 @@ def find_gutters(boxes, rx0, rx1, H, lh):
         g = lo + (a + b) / 2
         L = [x for x in cand if x[2] <= g]; R = [x for x in cand if x[0] >= g]
         span = lambda S: max(x[3] for x in S) - min(x[1] for x in S) if S else 0
+        med = lambda S: sorted(x[2] - x[0] for x in S)[len(S) // 2]
+        if med(L) < .2 * rw or med(R) < .2 * rw: continue   # 一侧只有悬挂的注号、序号（窄列短条）：不是分栏
         if len(L) >= .2 * len(cand) and len(R) >= .2 * len(cand) and span(L) > .15 * H and span(R) > .15 * H:
             gs.append(round(g))
     return gs
@@ -566,6 +573,23 @@ def reading_order(ls):
         for r in rows: out += sorted(r[2], key=lambda l: l['box'][0])
     return out
 
+def top_rule(im, H, W, rows):
+    """页顶 18% 内一条长横线（>40% 页宽，允许略歪）且线上方只有一两行字 → 返回线下沿的 y；没有则 None"""
+    import numpy as np
+    lim = int(H * .18); sums = im[:lim, :].sum(1)
+    for y in range(8, lim - 24):
+        if sums[y] < W * .05 or sums[y - 6:y].max() > W * .04: continue
+        e = y
+        while e < y + 16 and sums[e] >= W * .02: e += 1
+        if e - y > 15 or sums[e:e + 8].max() > W * .04: continue   # 线（略歪时横跨十几个像素行）上下都要是空白
+        u = im[y:e].any(0)
+        if u.sum() < W * .4: continue
+        d = np.diff(np.concatenate([[0], u.astype(np.int8), [0]]))
+        if (np.where(d == -1)[0] - np.where(d == 1)[0]).max() < W * .3: continue   # 要是连续的线，不是一行字
+        above = [r for r in rows if bbox(r['box'])[3] <= e + 2]
+        if 0 < len(above) <= 3: return e + 2
+    return None
+
 def cmd_classify():
     import numpy as np
     from PIL import Image
@@ -577,6 +601,8 @@ def cmd_classify():
         if len(regs) > 1:
             rows = [s for r in rows for s in split_row(r, regs[0][1])]
         lh = statistics.median([bbox(r['box'])[3] - bbox(r['box'])[1] for r in rows] or [40])
+        hb = top_rule(im, H, W, rows)   # 书眉下的横线：线以上的行都是书眉（书眉位置比 header_band 低时也能认出）
+        HB = hb / H if hb else CFG['header_band']
         lines, cols, figs, rules = [], [], [], []
         for ri, (rx0, rx1) in enumerate(regs):
             rw = rx1 - rx0
@@ -584,13 +610,13 @@ def cmd_classify():
             wide = [bbox(r['box']) for r in rrows if bbox(r['box'])[2] - bbox(r['box'])[0] > rw * .6]
             LL = float(np.median([b[0] for b in wide])) if wide else rx0 + rw * .15
             RR = float(np.median([b[2] for b in wide])) if wide else rx0 + rw * .85
-            inner = [bbox(r['box']) for r in rrows if H * CFG['header_band'] < bbox(r['box'])[1] and bbox(r['box'])[3] < H * CFG['folio_band']]
+            inner = [bbox(r['box']) for r in rrows if H * HB < bbox(r['box'])[1] and bbox(r['box'])[3] < H * CFG['folio_band']]
             rfigs = find_figures(im, [bbox(r['box']) for r in rrows], rx0, rx1, H, lh) if CFG.get('figures', True) else []
             infig = lambda b: any(f['box'][0] - 8 <= (b[0] + b[2]) / 2 <= f['box'][2] + 8 and f['box'][1] - 8 <= (b[1] + b[3]) / 2 <= f['box'][3] + 8 for f in rfigs)
             def tight(r):   # 用逐字框收紧行框（OCR 行框常向外多出半个字）
                 b = bbox(r['box']); cb = r.get('cboxes') or []
                 return [min(c[0] for c in cb), b[1], max(c[1] for c in cb), b[3]] if cb else b
-            tb = [tight(r) for r in rrows if H * CFG['header_band'] < bbox(r['box'])[1] and bbox(r['box'])[3] < H * CFG['folio_band']]
+            tb = [tight(r) for r in rrows if H * HB < bbox(r['box'])[1] and bbox(r['box'])[3] < H * CFG['folio_band']]
             gs = find_gutters([b for b in tb if not infig(b)], rx0, rx1, H, lh)
             for g in gs: rrows = [s for r in rrows for s in split_row(r, g)]
             edges = [rx0] + gs + [rx1]; cols.append([[a, b] for a, b in zip(edges, edges[1:])]); figs += rfigs
@@ -603,7 +629,7 @@ def cmd_classify():
             for r in rrows:
                 for t, b in split_margin(im[:, rx0:rx1], r['text'], [v - (rx0 if i % 2 == 0 else 0) for i, v in enumerate(bbox(r['box']))], rw, CFG['margin_regex']):
                     b = [b[0] + rx0, b[1], b[2] + rx0, b[3]]
-                    if b[3] < H * CFG['header_band'] and not (b[2] - b[0] > rw * .6 and re.search(r'[，。、；：]', t)): k = 'header'   # 页顶的长行是正文（照片/翻拍时正文可能顶到页边）
+                    if b[3] < H * HB and not (b[2] - b[0] > rw * .6 and re.search(r'[，。、；：]', t)): k = 'header'   # 页顶的长行是正文（照片/翻拍时正文可能顶到页边）
                     elif b[1] > H * CFG['folio_band'] and len(t) <= 4:
                         k = 'folio'
                         if CFG['page_offset'] is not None: t = str(pg + CFG['page_offset'])
@@ -640,6 +666,17 @@ def cmd_classify():
               ''.join(f" {f['type']}{f['box']}" for f in figs)
         for l in lines: [l.pop(k, None) for k in ('bx',)]
         print(pg, 'rule', rules if len(rules) > 1 else rules[0], lay, dict(Counter(l['kind'] for l in lines)), 'GAPS' if gaps else '', gaps or '', 'LOW' if low else '', low or '')
+    # 书眉补认：页顶第一行去掉数字后的文字在 ≥3 页重复出现（"8 书名"、"章名 29"）→ 书眉（没有横线、或横线没检出的页）
+    def first(p):
+        b = [l for l in p['lines'] if l['kind'] in ('body', 'header') and l['box'][3] < p['h'] * .16]
+        return min(b, key=lambda l: l['box'][1]) if b else None
+    key = lambda t: re.sub(r'[\d\s　]', '', t)
+    rep = Counter(key(f['ocr']) for f in map(first, pages.values()) if f and len(key(f['ocr'])) >= 2)
+    nfix = 0
+    for p in pages.values():
+        f = first(p)
+        if f and f['kind'] == 'body' and rep[key(f['ocr'])] >= 3 and len(f['ocr']) < 30: f['kind'] = 'header'; nfix += 1
+    if nfix: print('按重复文字补认书眉', nfix, '页')
     json.dump(pages, open(J('lines.json'), 'w'), ensure_ascii=False, indent=1)
     print('注意：GAPS 可能是漏识别的行（也可能是标题/段间距），对图核实后写入 corrections.ADD；无 rule 但有脚注的页写 rule_override（双页右页用 "页.1"）')
 
@@ -778,20 +815,23 @@ NOT_SUP = '個个章節节頁页卷年月日世紀纪次種种位項项條条點
 INTO = '进進闯闖导導纳納输輸介侵深潜潛渗滲植融嵌编編卷捲'
 AMBIG = set('采后里干发面系只台云余松准冲制征志周历范谷尽丑党借才折于御吁致姜困克划向咸占凶卜几了布并朴仆斗钟表复须游')
 
-def autofix_rules(trad):
+def autofix_rules(trad, circ=False):
     zh_dash = '——'
     return [
         (rf'(?<={CJK})(?<!一)(一一|—一|一—)(?!一|[个個位種种次些])(?={CJK}|$)', zh_dash, '破折号'),
         (r'暖昧', '曖昧' if trad else '暧昧', '形近字'),
         (r'(?<![各獨独親亲])自已(?![經经])', '自己', '形近字'),
         (r'己(?=[经經])', '已', '形近字'),
+        (r'(?<=[利克舍知异異])已(?![经經])', '己', '形近字'),
         (r'(?<=而)己(?=[。，；！？」』）”]|$)', '已', '形近字'),
         (rf'(?<=[{INTO}])人(?![们們员員士性民口物格类類家生心身])', '入', '入/人'),
         (r'([，。；：、])\1', r'\1', '重复标点'),
         (r'(?<=\d)[Oo](?=\d)', '0', '字母当数字'),
         (r'(?<=\d)[lI](?=\d)', '1', '字母当数字'),
-        (rf'(?<=[。，；：！？」』）”])(\d{{1,2}})(?=[\u3400-\u9fff「（](?<![{NOT_SUP}]))', lambda m: m[1].translate(SUP), '脚注上标'),
-    ]
+        (r'(?<=\d)[一－](?=\d)', '—', '数字范围的连接号'),
+    ] + ([] if circ else [   # 书里注码是 ①②③ 时不做（"约3：16"这类经文章节号会被误改）
+        (rf'(?<![\d][：:])(?<=[。，；：！？」』）”])(\d{{1,2}})(?=[\u3400-\u9fff「（](?<![{NOT_SUP}]))', lambda m: m[1].translate(SUP), '脚注上标'),
+    ])
 
 def cmd_autofix():
     P = json.load(open(J('lines.json'))); en = lang() == 'en'
@@ -809,17 +849,70 @@ def cmd_autofix():
         nt = sum(a != b for a, b in zip(allt, t2s.convert(allt))); ns = sum(a != b for a, b in zip(allt, s2t.convert(allt)))
         trad = nt > 3 * ns
     else: trad = len(re.findall('[們這來說會為與國學個於對時從]', allt)) > len(re.findall('[们这来说会为与国学个于对时从]', allt))
-    rules = autofix_rules(trad)
+    circ = len(re.findall('[①-⑳㉑-㉟㊱-㊿]', allt)) >= 5   # 注码用圈码的书
+    rules = autofix_rules(trad, circ)
     if s2t:
         s2t_full = opencc.OpenCC('s2t'); memo = {}
         def simp_only(c):   # 只算纯简体字（务/号/机/内…）；裏/着/祕/群 这类繁体异体不动
             if c not in memo: memo[c] = bool(re.match(r'[\u3400-\u9fff]', c)) and s2t_full.convert(c) != c and s2t.convert(c) != c and t2s.convert(c) == c
             return memo[c]
+    # 尾注圈码：注释区行首单独识别出的注码（①常被读成 1、⑩ 读成 0）按前后圈码的顺序补成圈码
+    CIRC = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳' + ''.join(map(chr, range(0x3251, 0x3260))) + ''.join(map(chr, range(0x32B1, 0x32C0))); mk = {}
+    def cnum(n): return CIRC[n - 1] if 1 <= n <= len(CIRC) else f'({n})'   # ㊿ 以后 Unicode 没有圈码：写成 (51)
+    if circ:
+        # 1) 找注码：注释区行首单独一小块（数字/圈码，常错读），或行首圈码后接正文；三位注码可能被当成边码
+        DIG = str.maketrans({'O': '0', 'o': '0', 'D': '0', 'I': '1', 'l': '1', '(': '', ')': '', '（': '', '）': ''})
+        def cvals(code):   # 注码可能的值：识出的数字、丢了首位的三位数、⑲读成⑨
+            d = ''.join(str(CIRC.index(c) + 1) if c in CIRC else c for c in code).translate(DIG)
+            if not d.isdigit() or not 0 < int(d) < 1000: return set()
+            v = int(d); S = {v, v + 100, v + 200} if v < 100 else {v}
+            if len(code) == 1 and code in CIRC: S.add(v + 10)
+            return S
+        runs, run, relk = [], [], False
+        body_x0 = {pg: min([x['box'][0] for x in P[pg]['lines'] if x['kind'] == 'body'] or [0]) for pg in P}
+        for pg in sorted(P, key=int):
+            ls = P[pg]['lines']; found = []
+            for i in sorted(range(len(ls)), key=lambda i: ls[i]['box'][1]):
+                l = ls[i]; t = l['ocr'].strip(); b = l['box']; h = b[3] - b[1]
+                if l['kind'] not in ('body', 'note', 'margin') or not t: continue
+                right = any(x is not l and x['kind'] in ('body', 'note') and abs((x['box'][1] + x['box'][3]) / 2 - (b[1] + b[3]) / 2) < h * .6
+                            and x['box'][0] > b[0] + .5 * (b[2] - b[0]) for x in ls)
+                if re.fullmatch(f'[{CIRC}0-9OoDIlE()（）]{{1,5}}', t) and b[2] - b[0] < 2.6 * h and right:
+                    found.append((pg, i, t, '', cvals(t), l.get('conf', 0)))
+                elif l['kind'] != 'margin' and b[0] < body_x0[pg] + 2 * h and (m := re.match(f'^([{CIRC}]+[0-9]?)(?=\\D)', t)):
+                    found.append((pg, i, m[1], t[len(m[1]):], cvals(m[1]), 0))
+            if found: run += found
+            elif run: runs.append(run); run = []
+        if run: runs.append(run)
+        # 2) 每段连续的注释页里按顺序编号：识出的值接得上就用；跳号要后面的注码印证；读不出的按顺序 +1
+        for run in runs:
+            cur = 0
+            for j, (pg, i, code, rest, S, cf) in enumerate(run):
+                nxt = cur + 1; ahead = [r[4] for r in run[j + 1:j + 3]]
+                if j == 0 and S and nxt not in S: cur = min(S)
+                elif nxt in S: cur = nxt
+                elif 1 in S and cur > 3 and ahead and 2 in ahead[0]: cur = 1   # 新一章注释从 1 起
+                else:
+                    jump = [x for x in sorted(S) if nxt < x <= nxt + 10 and (any(x < y <= x + k + 3 for k, A in enumerate(ahead) for y in A) or not ahead or (re.fullmatch(r'\d{3}', code) and x == int(code)))]
+                    d1 = ''.join(str(CIRC.index(c) + 1) if c in CIRC else c for c in code)
+                    if not jump and len(d1) == 1 and d1.isdigit():   # 只读出个位（54 → ④）：取下一个个位相同的号
+                        x = next(x for x in range(nxt, nxt + 10) if (x // 10 % 10 if code in CIRC and cur >= 99 else x % 10) == int(d1))   # 三位圈码常只认出中间一位
+                        if all(min(A) > x for A in ahead if A): jump = [x]
+                    cur = jump[0] if jump else nxt
+                new = cnum(cur) + rest
+                if cur not in S: sus.append(f'p{pg} [注码按顺序推定，对图核实] {code}{rest[:12]} → {cnum(cur)}')
+                if new != code + rest: mk[(pg, i)] = new
+                l = P[pg]['lines'][i]
+                if l['kind'] == 'margin': l['kind'] = 'body'; relk = True   # 三位注码曾被当成边码
+        if relk: json.dump(P, open(J('lines.json'), 'w'), ensure_ascii=False, indent=1)
+        for k in mk: texts.setdefault(k, P[k[0]]['lines'][k[1]]['ocr'])   # 改了类别的注码行也要进改动表
     # 全书词频：三字窗口
     cnt = Counter(t[i:i + n] for t in texts.values() for n in (3,) for i in range(len(t) - n + 1))
     def note(pg, kind, a, b, why): rep.append(f'p{pg} [{why}] {a} → {b}')
     for (pg, i), t in texts.items():
         l = P[pg]['lines'][i]; new = t; garbled = False; n0 = len(rep)
+        if (pg, i) in mk:
+            note(pg, l['kind'], t, mk[(pg, i)], '尾注圈码'); fix.setdefault(pg, {})[t] = mk[(pg, i)]; continue
         for pat, r, why in rules:
             n2 = re.sub(pat, r, new)
             if n2 != new: note(pg, l['kind'], new, n2, why); new = n2
@@ -891,16 +984,22 @@ def page_labels(pages):
         for ri in range(k[pg]):
             inr = lambda l: l.get('ri', 0) == ri
             cands = [l for l in p['lines'] if l['kind'] == 'folio' and inr(l)] + \
-                    [l for l in p['lines'] if l['kind'] == 'header' and inr(l) and re.fullmatch(r'\d{1,4}|[ivxlcIVXLC]{1,7}', l['ocr'].strip())]
+                    [l for l in p['lines'] if l['kind'] == 'header' and inr(l) and re.fullmatch(r'\d{1,4}|[ivxlcIVXLC]{1,7}', l['ocr'].strip())] + \
+                    [l for l in p['lines'] if l['kind'] == 'header' and inr(l) and re.search(r'^\d{1,4}(?=\s*\D)|(?<=\D)\d{1,4}$', l['ocr'].strip())]
             got = None
             for l in cands:
                 t = l['ocr'].strip()
+                if l['kind'] == 'header' and not re.fullmatch(r'\d{1,4}|[ivxlcIVXLC]{1,7}', t):   # "8 书名" / "章名 29"：页码和书眉在同一行
+                    t = re.search(r'^\d{1,4}(?=\s*\D)|(?<=\D)\d{1,4}$', t).group(0)
                 if re.fullmatch(r'\d{1,4}', t): got = ('D', int(t) - ri - cum[pg]); break
                 if re.fullmatch(r'[ivxlcIVXLC]{1,7}', t): got = ('r', roman(t) - ri - cum[pg]); break
             if got: seen[pg] = got; break
+    seen = {pg: v for pg, v in seen.items() if v[1] + cum[pg] <= 2 * c + 50}   # 封面上的大数字（书号、定价）不是页码
     if CFG['page_offset'] is not None:
         seen = {pg: ('D', CFG['page_offset'] + 1) for pg in pages}
     if not seen: return {}, []
+    for pg in sorted(seen):   # 章首页常不印页码：新编号从 2 开始时，前一页就是 1
+        if seen[pg][1] + cum[pg] == 2 and pg - 1 in pages and pg - 1 not in seen: seen[pg - 1] = seen[pg]
     ks = sorted(seen)
     for i in range(1, len(ks) - 1):   # 某页与前后都不同且前后一致 → 误识
         a, b, cc = seen[ks[i - 1]], seen[ks[i]], seen[ks[i + 1]]
@@ -946,6 +1045,9 @@ def detect_toc(pages):
             x0 = min(l['box'][0] for l in ls); x1 = max(l['box'][2] for l in ls)
             h = max(l['box'][3] - l['box'][1] for l in ls)
             if len(text) > (70 if EN else 30) or re.search(r'[。；，：.,;:]$', text): continue
+            text = re.sub(r'[①-⑳㉑-㉟㊱-㊿¹²³⁴-⁹⁰]+$|(?<=\S)\(\d{1,3}\)$', '', text).strip()   # 标题末尾的注码
+            if not EN: text = re.sub(r'^(第[一二三四五六七八九十百零〇\d]+[章编部篇卷])(?=[^\s　])', r'\1 ', text)
+            if not EN and re.match(r'^\d{1,2}[.．、]', text) and (len(text) > 18 or '，' in text): continue   # 正文里的编号段落，不是小标题
             centered = abs((x0 + x1) / 2 - (bx[0] + bx[1]) / 2) < BW * .08 and (x1 - x0) < BW * .6
             lvl = None
             for pat, lv in CFG['toc_patterns']:
@@ -970,6 +1072,9 @@ def detect_toc(pages):
 
 def cmd_toc():
     pages = final_pages()
+    import pymupdf
+    st = pymupdf.open(CFG['src']).get_toc()
+    if len(st) >= 3 and CFG.get('toc_source', 'auto') == 'auto': print(f'原 PDF 有书签 {len(st)} 条，build 时沿用（toc_source:"detect" 改用下面的自动识别）')
     for t in detect_toc(pages): print('  ' * (t[0] - 1) + t[1], 'p', t[2])
     lab, ranges = page_labels(pages); print('page labels', ranges)
 
@@ -1054,7 +1159,7 @@ def cmd_build():
             return uniform(text, x0, x1)
         return pos
 
-    doc = pymupdf.open(CFG['src'])
+    doc = pymupdf.open(CFG['src']); src_toc = doc.get_toc(False)   # 原 PDF 自带的书签（往往比自动识别准）
     for page in doc:   # 去掉原有的文字层（如 macOS 实况文本留下的乱码），只留扫描图
         if page.get_text().strip():
             page.add_redact_annot(page.rect)
@@ -1172,7 +1277,9 @@ def cmd_build():
         doc.update_stream(xs[0], ('q\n' + head + stream + '\nQ\n').encode())
     lab, ranges = page_labels(pages)   # 页标签=印刷页码，Zotero/阅读器引用时用
     if ranges: doc.set_page_labels(ranges); print('page labels', ranges)
-    if CFG['toc'] and '--no-toc' not in ARGS:
+    if CFG['toc'] and '--no-toc' not in ARGS and len(src_toc) >= 3 and CFG.get('toc_source', 'auto') == 'auto':
+        doc.set_toc(src_toc); print('toc 沿用原书签', len(src_toc), '条（config toc_source:"detect" 改用自动识别）')
+    elif CFG['toc'] and '--no-toc' not in ARGS:
         toc = detect_toc(pages); items = []
         for lvl, title, pg, d in toc:
             pr = doc[pg - 1].rect
