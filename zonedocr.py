@@ -851,12 +851,62 @@ def clean_greek(t, lang):
         t = re.sub(rf"^[^{HEB}(\[]+|[^{HEB})\].,;]+$", '', t)
     return re.sub(r'\s+', ' ', t)
 
+def tess_batch(crops, lang):
+    """多块裁图竖排拼成一张图，一次 Tesseract（psm 6, TSV）读完，返回每块的 [(置信度, 词)]"""
+    from PIL import Image
+    Wm = max(c.width for c in crops) + 80; can = Image.new('L', (Wm, sum(c.height + 50 for c in crops) + 50), 255); y = 50; ys = []
+    for c in crops: can.paste(c, (40, y)); ys.append((y, y + c.height)); y += c.height + 50
+    with tempfile.NamedTemporaryFile(suffix='.png') as f:
+        can.save(f.name)
+        out = subprocess.run(['tesseract', f.name, '-', '-l', lang, '--psm', '6', '--tessdata-dir', tess_lang(lang), '-c', 'tessedit_create_tsv=1'], capture_output=True, text=True).stdout
+    res = [[] for _ in crops]
+    for line in out.splitlines()[1:]:
+        f = line.split('\t')
+        if len(f) < 12 or f[0] != '5' or not f[11].strip(): continue
+        cy = int(f[7]) + int(f[9]) / 2
+        k = next((k for k, (a, b) in enumerate(ys) if a - 20 <= cy <= b + 20), None)
+        if k is not None: res[k].append((float(f[10]), f[11]))
+    return res
+
+def latin_greek(P, Wd):
+    """整段被读成拉丁字母的希腊文（"Xpotos Kopos"）：中文行里每段拉丁字母同时用 eng 和 grc 读，
+    英文模型读不通（置信≤30）、希腊文模型读得通（≥45，高出≥25）、结果全是希腊字母且有小写 → 判为希腊文。
+    全大写缩写（ThW、MPTH）希腊/拉丁字形相同，不算。返回 [(页, 行号, a, b, 原文, 希腊文)]"""
+    from PIL import Image
+    cands = []
+    for pg, p in P.items():
+        rows = Wd.get(pg, []); jt = lambda r: ''.join(r.get('chars') or [])
+        for li, l in enumerate(p['lines']):
+            if l['kind'] not in ('body', 'note', 'caption') or 'ocr0' in l or not re.search(CJK, l['ocr']): continue
+            src = l['ocr']; row = next((r for r in rows if r.get('chars') and src in jt(r) and abs(bbox(r['box'])[1] - l['box'][1]) < 15), None)
+            if not row or len(row['chars']) != len(row['cboxes']) or len(jt(row)) != len(row['chars']): continue
+            off = jt(row).index(src); cb = row['cboxes'][off:off + len(src)]; yb = bbox(row['box'])
+            for m in re.finditer(r"[A-Za-z][A-Za-z'’ .]*[A-Za-z]", src):
+                if len(re.findall('[A-Za-z]', m[0])) < 4 or not re.search('[a-z]', m[0]): continue
+                a, b = m.span(); cands.append((pg, li, a, b, m[0], (int(cb[a][0]) - 3, int(yb[1]) - 6, int(cb[b - 1][1]) + 3, int(yb[3]) + 6)))
+    out = []; ims = {}
+    for i in range(0, len(cands), 40):
+        bt = cands[i:i + 40]; crops = []
+        for c in bt:
+            if c[0] not in ims: ims = {c[0]: Image.open(images()[int(c[0]) - 1]).convert('L')}
+            cr = ims[c[0]].crop(c[5]); crops.append(cr.resize((cr.width * 2, cr.height * 2)))
+        for c, e, g in zip(bt, tess_batch(crops, 'eng'), tess_batch(crops, 'grc')):
+            ce = sum(x for x, _ in e) / len(e) if e else 0; cg = sum(x for x, _ in g) / len(g) if g else 0
+            t = clean_greek(' '.join(w for _, w in g), 'grc'); letters = re.findall(r'[^\W\d_]', t)
+            if ce <= 30 and cg >= 45 and len(letters) >= max(3, .7 * len(re.findall('[A-Za-z]', c[4]))) and cg - ce >= 25 and letters and sum(bool(re.match(f'[{GRK}]', x)) for x in letters) >= .9 * len(letters) \
+               and re.search(r'[α-ωά-ώἀ-ῷ]', t):
+                out.append((c[0], c[1], c[2], c[3], c[4], t))
+    return out
+
 def cmd_greek():
     from PIL import Image
     if not CFG.get('greek', True): print('config greek:false，跳过'); return
     if subprocess.run(['which', 'tesseract'], capture_output=True).returncode:
         print('提示：没有 tesseract（apt install tesseract-ocr），希腊文/希伯来文片段不重识别'); return
     P = json.load(open(J('lines.json'))); Wd = json.load(open(J('words.json'))); rep = []; nfix = 0
+    for p in P.values():   # 重跑：先还原上次改过的行
+        for l in p['lines']:
+            if 'ocr0' in l: l['ocr'] = l.pop('ocr0')
     for pg, p in P.items():
         rows = Wd.get(pg, []); im = None
         for l in p['lines']:
@@ -898,6 +948,10 @@ def cmd_greek():
             if new != src:
                 l['ocr0'] = src; l['ocr'] = new; nfix += 1
             elif 'ocr0' in l: l['ocr'] = src; del l['ocr0']
+    if CFG.get('greek_latin', True):   # 整段读成拉丁字母的希腊文
+        for pg, li, a, b, old, t in sorted(latin_greek(P, Wd), key=lambda x: -x[2]):
+            l = P[pg]['lines'][li]; src = l['ocr']; l['ocr'] = src[:a] + t + src[b:]; l.setdefault('ocr0', src); nfix += 1
+            rep.append(f'p{pg} [grc，原读成拉丁字母] {old} → {t}')
     json.dump(P, open(J('lines.json'), 'w'), ensure_ascii=False, indent=1)
     open(J('greek.txt'), 'w').write(f'希腊文/希伯来文重识别 {nfix} 行（都要对图复核：重音、词尾 ς、漏字）\n' + '\n'.join(rep) + '\n')
     print('希腊文/希伯来文重识别', nfix, '行 →', J('greek.txt'))
