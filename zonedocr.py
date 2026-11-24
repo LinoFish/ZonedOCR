@@ -10,6 +10,7 @@
   python3 zonedocr.py WORK classify   # 分区 -> lines.json，打印每页统计、疑似漏行、低置信行
   python3 zonedocr.py WORK gaps       # 对疑似漏行空隙裁图重识别，打印 ADD 候选
   python3 zonedocr.py WORK toc        # 预览自动识别的章节书签和页标签
+  python3 zonedocr.py WORK greek      # 希腊文/希伯来文片段裁出来用 Tesseract grc/heb 重识别（需 apt tesseract-ocr）-> greek.txt
   python3 zonedocr.py WORK autofix    # 自动校对：形近字、全书一致性、繁体书混入的简体字、脚注上标 -> autofix.json/.txt
   python3 zonedocr.py WORK proof      # 写 proof/pNNN.txt 供逐页对图校对
   python3 zonedocr.py WORK build [--zotero] [--debug] [--kinds body,note] [--out X.pdf]
@@ -17,6 +18,7 @@
   python3 zonedocr.py WORK overlay 2,13 [PDF]  # 渲染字符高亮框叠加图到 WORK/overlay/
 
 依赖: pip install rapidocr_onnxruntime pymupdf pymupdf-fonts numpy pillow opencc-python-reimplemented ; poppler-utils
+      可选 tesseract-ocr（apt，5.x）：希腊文/希伯来文片段重识别（greek 步骤；模型自动下载）
 """
 import sys, os, re, json, glob, statistics, difflib, importlib.util, subprocess, tempfile, math
 from collections import Counter
@@ -803,6 +805,104 @@ def final_pages():
     return pages
 
 
+# ---------------------------------------------------------------- greek：希腊文/希伯来文片段专用引擎重识别
+# RapidOCR（PaddleOCR 中文模型）认不出希腊文：常读成 "λoYosτoθεo"、"πapaδδova" 这类希腊/拉丁混杂乱码。
+# 这里找出这些片段，按逐字框只裁出那一段（左右延到相邻中文字边缘），交给 Tesseract grc（带重音的古希腊文，
+# tessdata_best）重识别后换回；希伯来字母片段用 heb。原文存在 lines.json 的 ocr0，重跑时从 ocr0 开始。
+# 清单写 greek.txt（全部对图复核）。需 apt 的 tesseract（5.x）；模型自动下载到 models/tessdata。config greek:false 关闭。
+GRK = '\u0370-\u03ff\u1f00-\u1fff'
+HEB = '\u0590-\u05ff'
+TESS = 'https://github.com/tesseract-ocr/tessdata_best/raw/main/'
+
+def tess_lang(l):
+    d = os.path.join(MODELS, 'tessdata'); os.makedirs(d, exist_ok=True); f = os.path.join(d, l + '.traineddata')
+    if not os.path.exists(f): subprocess.run(['curl', '-sL', '-o', f, TESS + l + '.traineddata'], check=True)
+    return d
+
+def foreign_spans(chars):
+    """返回 [(i0, i1, lang)]：字符序列里的希腊文（含被读成拉丁字母的部分）/希伯来文片段，含紧邻的 ( ) [ ]"""
+    out = []; k = 0; n = len(chars)
+    unit = re.compile(rf"[{GRK}{HEB}A-Za-zâàāûūêîôⅠ-Ⅻ\u0300-\u036f'’ .,;·&]")   # & 常是 ἀ 的误读
+    ok = lambda j: unit.match(chars[j]) or (chars[j].isdigit() and 0 < j < n - 1 and re.match(rf'[{GRK}A-Za-z]', chars[j - 1]) and re.match(rf'[{GRK}A-Za-z]', chars[j + 1]))   # 夹在字母间的数字（θ→0）
+    while k < n:
+        if not ok(k): k += 1; continue
+        j = k
+        while j < n and ok(j): j += 1
+        seg = ''.join(chars[k:j]); h = len(re.findall(f'[{HEB}]', seg))
+        g = len(re.findall(f'[{GRK}]', seg.replace('β', ''))) + len(re.findall('[âàāûūêîô]', seg))   # ā/û 这类带长音/扬抑符的拉丁字母也是希腊文误读的迹象；β 单独不算（德文 ß 常读成 β）
+        lt = len(re.findall(rf'[{GRK}{HEB}A-Za-zâàāûūêîô]', seg))
+        paren = (k > 0 and chars[k - 1] in '([（') or (j < n and chars[j] in ')]）')
+        if (g >= 2 and g >= .2 * lt) or (g >= 1 and paren and lt >= 3) or h >= 2:   # 括号里的片段只要有一个希腊字母（行首接上一行的 "oostoθo)"）
+            a, b = k, j
+            while a < b and chars[a] in " .,;'’": a += 1
+            while b > a and chars[b - 1] in " ,;'’": b -= 1
+            if a > 0 and chars[a - 1] in '([（': a -= 1
+            if b < n and chars[b] in ')]）': b += 1
+            out.append((a, b, 'heb' if h > g else 'grc'))
+        k = j
+    return out
+
+def clean_greek(t, lang):
+    t = t.strip().replace('\n', ' ')
+    if lang == 'grc':
+        t = re.sub(rf'(?<=[{GRK}])ϑ?[βσϑ5](?![{GRK}A-Za-z0-9])', 'ς', t)   # 词尾 ς：Tesseract 常读成 β/ϑ/5
+        t = re.sub(rf"^[^{GRK}(\[]+|[^{GRK})\].,;·]+$", '', t)
+    else:
+        t = re.sub(rf"^[^{HEB}(\[]+|[^{HEB})\].,;]+$", '', t)
+    return re.sub(r'\s+', ' ', t)
+
+def cmd_greek():
+    from PIL import Image
+    if not CFG.get('greek', True): print('config greek:false，跳过'); return
+    if subprocess.run(['which', 'tesseract'], capture_output=True).returncode:
+        print('提示：没有 tesseract（apt install tesseract-ocr），希腊文/希伯来文片段不重识别'); return
+    P = json.load(open(J('lines.json'))); Wd = json.load(open(J('words.json'))); rep = []; nfix = 0
+    for pg, p in P.items():
+        rows = Wd.get(pg, []); im = None
+        for l in p['lines']:
+            if l['kind'] not in ('body', 'note', 'caption'): continue
+            src = l.get('ocr0', l['ocr'])
+            if not re.search(f'[{GRK}{HEB}]', re.sub(r'(?<=[a-zäöü])β(?![\u0370-\u03ff])', '', src)): continue   # 只有德文 ß→β 的行不管（autofix 改）
+            # 找到这行对应的 OCR 行（行可能被拆过边码/分栏）：同一高度、文字包含本行
+            jt = lambda r: ''.join(r.get('chars') or [])   # 用逐字列表拼的文字定位（text 里 â 可能是分解形式，下标会错位）
+            row = next((r for r in rows if r.get('chars') and src in jt(r) and abs(bbox(r['box'])[1] - l['box'][1]) < 15), None)
+            if not row or len(row['chars']) != len(row['cboxes']) or len(jt(row)) != len(row['chars']): rep.append(f'p{pg} [含希腊字母但没对上逐字框，对图看] {src}'); continue
+            off = jt(row).index(src); ch = row['chars'][off:off + len(src)]; cb = row['cboxes'][off:off + len(src)]
+            sp = foreign_spans(ch)
+            if not sp: rep.append(f'p{pg} [含希腊字母但未重识别，对图看] {src}'); continue
+            if im is None: im = Image.open(images()[int(pg) - 1]).convert('L')
+            y0, y1 = int(bbox(row['box'])[1]) - 8, int(bbox(row['box'])[3]) + 8
+            new = src
+            for a, b, lg in reversed(sp):
+                x0 = cb[a - 1][1] + 1 if a > 0 else max(0, cb[a][0] - 12)   # 左右延到相邻字边缘（OCR 常漏掉希腊字母，字框没覆盖全）
+                x1 = cb[b][0] - 1 if b < len(cb) else min(im.width, cb[b - 1][1] + 12)
+                cr = im.crop((x0, y0, x1, y1)); cr = cr.resize((cr.width * 2, cr.height * 2))
+                pad = Image.new('L', (cr.width + 60, cr.height + 60), 255); pad.paste(cr, (30, 30)); cr = pad   # 四周留白，Tesseract 认得更稳
+                if os.environ.get('GREEK_DUMP'): cr.save(J(f'greek_p{pg}_{x0}.png'))
+                with tempfile.NamedTemporaryFile(suffix='.png') as f:
+                    cr.save(f.name)
+                    t = subprocess.run(['tesseract', f.name, '-', '-l', lg, '--psm', '7', '--tessdata-dir', tess_lang(lg)], capture_output=True, text=True).stdout
+                t = clean_greek(t, lg); old = ''.join(ch[a:b])
+                ok = len(re.findall(f'[{GRK if lg == "grc" else HEB}]', t)) >= max(2, .6 * len(re.findall(r'\w', t)))
+                if ch[b - 1] not in '.,;·' and b < len(ch) and re.match(CJK, ch[b]): t = t.rstrip('.,;· ')   # 右边紧接中文：末尾的点是邻字笔画
+                L = f'[{GRK if lg == "grc" else HEB}]'; gl = lambda t: [i for i, c in enumerate(t) if re.match(L, c) and c.isalpha()]; gi = gl(t)   # 只算字母，᾿ 这类单独的气息符不算
+                if gi and ch[a] in '([（':   # 括号：只留最靠近希腊文的一对，切掉裁图边缘带进来的 "[" "|" 等
+                    k0 = t.rfind('(', 0, gi[0]); t = t[k0:] if k0 >= 0 else '(' + t[gi[0]:]
+                    gi = gl(t)
+                if gi and ch[b - 1] in ')]）':
+                    k1 = t.find(')', gi[-1]); t = t[:k1 + 1] if k1 >= 0 else t[:gi[-1] + 1].rstrip() + ')'
+                if ok and t != old:
+                    new = new[:a] + t + new[b:]
+                    rep.append(f'p{pg} [{lg}] {old} → {t}')
+                elif not ok: rep.append(f'p{pg} [{lg} 未采用，对图重打] {old} （引擎读出：{t}）')
+            if new != src:
+                l['ocr0'] = src; l['ocr'] = new; nfix += 1
+            elif 'ocr0' in l: l['ocr'] = src; del l['ocr0']
+    json.dump(P, open(J('lines.json'), 'w'), ensure_ascii=False, indent=1)
+    open(J('greek.txt'), 'w').write(f'希腊文/希伯来文重识别 {nfix} 行（都要对图复核：重音、词尾 ς、漏字）\n' + '\n'.join(rep) + '\n')
+    print('希腊文/希伯来文重识别', nfix, '行 →', J('greek.txt'))
+
+
 # ---------------------------------------------------------------- autofix：自动校对可能识别错误的字
 # 不靠人工也能改掉的一类错：①形近字规则（带上下文，避免误伤）；②全书一致性——同一个词在书里出现多次，
 # 某处只差一个形近字、且这个写法全书只出现一次 → 按多数改；③繁体书里混进的简体字（v6 常见）→ 转回繁体；
@@ -829,6 +929,7 @@ def autofix_rules(trad, circ=False):
         (r'(?<=\d)[Oo](?=\d)', '0', '字母当数字'),
         (r'(?<=\d)[lI](?=\d)', '1', '字母当数字'),
         (r'(?<=\d)[一－](?=\d)', '—', '数字范围的连接号'),
+        (r'(?<=[a-zäöü])β(?![\u0370-\u03ff\u1f00-\u1fff])', 'ß', '德文ß'),
     ] + ([] if circ else [   # 书里注码是 ①②③ 时不做（"约3：16"这类经文章节号会被误改）
         (rf'(?<![\d][：:])(?<=[。，；：！？」』）”])(\d{{1,2}})(?=[\u3400-\u9fff「（](?<![{NOT_SUP}]))', lambda m: m[1].translate(SUP), '脚注上标'),
     ])
@@ -1316,4 +1417,4 @@ def cmd_overlay():
         p.get_pixmap(dpi=90).save(J(f'overlay/p{pn:03d}.png')); print(J(f'overlay/p{pn:03d}.png'))
 
 {'deskew': cmd_deskew, 'toc': cmd_toc, 'gaps': cmd_gaps, 'images': cmd_images, 'ocr': cmd_ocr, 'classify': cmd_classify, 'proof': cmd_proof,
- 'build': cmd_build, 'check': cmd_check, 'autofix': cmd_autofix, 'overlay': cmd_overlay}[CMD]()
+ 'build': cmd_build, 'check': cmd_check, 'autofix': cmd_autofix, 'greek': cmd_greek, 'overlay': cmd_overlay}[CMD]()
